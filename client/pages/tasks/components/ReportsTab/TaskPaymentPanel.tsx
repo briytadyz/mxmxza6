@@ -21,16 +21,20 @@ const TaskPaymentPanel: React.FC<TaskPaymentPanelProps> = ({ task }) => {
   const [method, setMethod] = useState<WorkerTaskPayment["payment_method"]>("bank_transfer");
   const [reference, setReference] = useState("");
   const [vatInput, setVatInput] = useState("");
+  const [manualRateInput, setManualRateInput] = useState("");
+  const [fxIssue, setFxIssue] = useState<string | null>(null);
 
   const agreedAmount = task.final_amount ?? 0;
   const hasAgreedAmount = agreedAmount > 0;
   const vatAmount = vatInput.trim() === "" ? 0 : Number(vatInput);
   const isVatValid = Number.isFinite(vatAmount) && vatAmount >= 0 && vatAmount < agreedAmount;
+  const manualRate = manualRateInput.trim() === "" ? null : Number(manualRateInput);
+  const isManualRateValid = manualRate === null || (Number.isFinite(manualRate) && manualRate > 0);
 
   const loadPayment = async () => {
     const { data, error } = await supabase
       .from("worker_task_payments")
-      .select("amount, tax_amount, currency_code, payment_method, payment_reference, paid_at")
+      .select("amount, tax_amount, currency_code, worker_currency_code, fx_rate, fx_rate_source, fx_rate_fetched_at, converted_amount, converted_tax_amount, payment_method, payment_reference, paid_at")
       .eq("task_id", task.id)
       .maybeSingle();
     if (error) {
@@ -55,21 +59,32 @@ const TaskPaymentPanel: React.FC<TaskPaymentPanelProps> = ({ task }) => {
       toast({ title: "Invalid VAT", description: "VAT must be zero or less than the agreed amount.", variant: "destructive" });
       return;
     }
+    if (!isManualRateValid) {
+      toast({ title: "Invalid rate", description: "The manual FX rate must be greater than zero.", variant: "destructive" });
+      return;
+    }
     setIsSaving(true);
     const { error } = await supabase.rpc("record_worker_task_payment", {
       p_task_id: task.id,
       p_payment_method: method,
       p_payment_reference: trimmedReference,
       p_tax_amount: vatAmount,
+      p_manual_fx_rate: manualRate,
     });
     setIsSaving(false);
     if (error) {
+      if (error.message.startsWith("FX_RATE_")) {
+        setFxIssue(error.message.replace(/^FX_RATE_\w+:\s*/, ""));
+        return;
+      }
       toast({ title: "Payment not recorded", description: error.message, variant: "destructive" });
       return;
     }
     toast({ title: "Payment recorded", description: "Posted to the hotel and worker Books." });
     setReference("");
     setVatInput("");
+    setManualRateInput("");
+    setFxIssue(null);
     void loadPayment();
   };
 
@@ -92,6 +107,15 @@ const TaskPaymentPanel: React.FC<TaskPaymentPanelProps> = ({ task }) => {
           </p>
           {payment.tax_amount > 0 && (
             <p>VAT included: {payment.tax_amount.toLocaleString()} {payment.currency_code}</p>
+          )}
+          {payment.worker_currency_code && payment.worker_currency_code !== payment.currency_code && payment.fx_rate !== null && payment.converted_amount !== null && (
+            <div className="pt-1 border-t border-green-200 space-y-1">
+              <p>Worker Books amount: {payment.converted_amount.toLocaleString()} {payment.worker_currency_code}</p>
+              <p>
+                Rate applied: 1 {payment.currency_code} = {payment.fx_rate.toLocaleString(undefined, { maximumFractionDigits: 6 })} {payment.worker_currency_code}
+                {payment.fx_rate_source === "manual" ? " (manual)" : payment.fx_rate_fetched_at ? ` (stored, fetched ${new Date(payment.fx_rate_fetched_at).toLocaleDateString()})` : ""}
+              </p>
+            </div>
           )}
           <p>Method: {PAYMENT_METHODS.find((item) => item.value === payment.payment_method)?.label ?? payment.payment_method}</p>
           <p>Reference: {payment.payment_reference}</p>
@@ -128,6 +152,24 @@ const TaskPaymentPanel: React.FC<TaskPaymentPanelProps> = ({ task }) => {
               className="w-full px-3 py-2 border border-gray-300 rounded-lg"
             />
           </div>
+          {fxIssue && (
+            <div className="p-3 bg-amber-50 border border-amber-200 rounded-lg text-sm text-amber-800 space-y-2">
+              <p>{fxIssue}</p>
+              <label htmlFor="worker-payment-manual-rate" className="block font-medium">
+                Manual exchange rate (units of worker Books currency per 1 hotel currency unit)
+              </label>
+              <input
+                id="worker-payment-manual-rate"
+                type="number"
+                min="0"
+                step="any"
+                value={manualRateInput}
+                onChange={(event) => setManualRateInput(event.target.value)}
+                placeholder="e.g. 0.00027"
+                className="w-full px-3 py-2 border border-gray-300 rounded-lg bg-white"
+              />
+            </div>
+          )}
           <div>
             <label htmlFor="worker-payment-reference" className="block text-sm font-medium text-gray-700 mb-1">
               Payment reference
@@ -144,7 +186,10 @@ const TaskPaymentPanel: React.FC<TaskPaymentPanelProps> = ({ task }) => {
           <button
             type="button"
             onClick={() => void handleRecordPayment()}
-            disabled={!hasAgreedAmount || isSaving || !reference.trim() || !isVatValid}
+            disabled={
+              !hasAgreedAmount || isSaving || !reference.trim() || !isVatValid ||
+              (fxIssue !== null && (manualRate === null || !isManualRateValid))
+            }
             className="px-4 py-2 bg-sheraton-gold text-sheraton-navy rounded-lg font-semibold disabled:opacity-50"
           >
             {isSaving ? "Recording..." : "Record payment"}

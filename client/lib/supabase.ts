@@ -141,6 +141,12 @@ export interface WorkerTaskPayment {
   amount: number
   tax_amount: number
   currency_code: string
+  worker_currency_code: string | null
+  fx_rate: number | null
+  fx_rate_source: 'same_currency' | 'stored' | 'manual' | null
+  fx_rate_fetched_at: string | null
+  converted_amount: number | null
+  converted_tax_amount: number
   payment_method: 'cash' | 'bank_transfer' | 'mobile_money' | 'card' | 'other'
   payment_reference: string
   paid_at: string

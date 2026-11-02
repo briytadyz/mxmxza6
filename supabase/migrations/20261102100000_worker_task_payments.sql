@@ -66,6 +66,12 @@ create table if not exists public.worker_task_payments (
   amount numeric(20,4) not null check (amount > 0),
   tax_amount numeric(20,4) not null default 0 check (tax_amount >= 0 and tax_amount < amount),
   currency_code char(3) not null,
+  worker_currency_code char(3),
+  fx_rate numeric(24,12) check (fx_rate > 0),
+  fx_rate_source text,
+  fx_rate_fetched_at timestamptz,
+  converted_amount numeric(20,4) check (converted_amount > 0),
+  converted_tax_amount numeric(20,4) not null default 0 check (converted_tax_amount >= 0),
   payment_method text not null check (payment_method in ('cash', 'bank_transfer', 'mobile_money', 'card', 'other')),
   payment_reference text not null,
   paid_at timestamptz not null default now(),
@@ -74,6 +80,20 @@ create table if not exists public.worker_task_payments (
   worker_journal_transaction_id uuid references public.books_journal_transactions(id) on delete restrict,
   created_at timestamptz not null default now()
 );
+
+alter table public.worker_task_payments
+  add column if not exists tax_amount numeric(20,4) not null default 0,
+  add column if not exists worker_currency_code char(3),
+  add column if not exists fx_rate numeric(24,12),
+  add column if not exists fx_rate_source text,
+  add column if not exists fx_rate_fetched_at timestamptz,
+  add column if not exists converted_amount numeric(20,4),
+  add column if not exists converted_tax_amount numeric(20,4) not null default 0;
+
+alter table public.worker_task_payments drop constraint if exists worker_task_payments_fx_rate_source_check;
+alter table public.worker_task_payments
+  add constraint worker_task_payments_fx_rate_source_check
+  check (fx_rate_source in ('same_currency', 'stored', 'manual'));
 
 alter table public.worker_task_payments enable row level security;
 revoke all on public.worker_task_payments from public, anon, authenticated;
@@ -100,23 +120,12 @@ declare
   worker_profile record;
   registered_business_name text;
   worker_entity_type text;
-  existing_currency char(3);
 begin
   perform pg_advisory_xact_lock(hashtextextended('worker-books:' || target_user_id::text, 0));
   select workspace.organization_id into worker_organization_id
     from public.books_worker_workspaces workspace
    where workspace.user_id = target_user_id;
   if worker_organization_id is not null then
-    select organization.base_currency into existing_currency
-      from public.books_organizations organization where organization.id = worker_organization_id;
-    if org_currency is not null and existing_currency is distinct from org_currency then
-      if exists (select 1 from public.books_journal_transactions where organization_id = worker_organization_id)
-         or exists (select 1 from public.books_expenses where organization_id = worker_organization_id)
-         or exists (select 1 from public.books_invoices where organization_id = worker_organization_id) then
-        raise exception 'Worker Business Books already has transactions in %', existing_currency;
-      end if;
-      update public.books_organizations set base_currency = org_currency where id = worker_organization_id;
-    end if;
     return worker_organization_id;
   end if;
 
@@ -187,11 +196,60 @@ $$;
 revoke all on function public.get_or_create_worker_books_organization() from public, anon;
 grant execute on function public.get_or_create_worker_books_organization() to authenticated;
 
+create or replace function public.books_task_payment_fx_rate(from_currency char(3), to_currency char(3))
+returns table (fx_rate numeric, rate_fetched_at timestamptz, rate_status text)
+language plpgsql
+stable
+security definer
+set search_path = pg_catalog, public
+as $$
+declare
+  from_leg numeric;
+  to_leg numeric;
+  from_fetched timestamptz;
+  to_fetched timestamptz;
+begin
+  if from_currency = to_currency then
+    return query select 1::numeric, now(), 'same_currency'::text;
+    return;
+  end if;
+
+  if from_currency = 'UGX' then
+    from_leg := 1;
+  else
+    select f.rate, f.fetched_at into from_leg, from_fetched
+      from public.books_fx_rates f
+     where f.base_currency = 'UGX' and f.quote_currency = from_currency;
+  end if;
+  if to_currency = 'UGX' then
+    to_leg := 1;
+  else
+    select f.rate, f.fetched_at into to_leg, to_fetched
+      from public.books_fx_rates f
+     where f.base_currency = 'UGX' and f.quote_currency = to_currency;
+  end if;
+
+  if from_leg is null or to_leg is null then
+    return query select null::numeric, null::timestamptz, 'missing'::text;
+    return;
+  end if;
+
+  return query select
+    round(to_leg / from_leg, 12),
+    least(from_fetched, to_fetched),
+    case when least(from_fetched, to_fetched) < now() - interval '7 days' then 'stale' else 'stored' end;
+end;
+$$;
+revoke all on function public.books_task_payment_fx_rate(char(3), char(3)) from public, anon, authenticated;
+
+drop function if exists public.record_worker_task_payment(uuid, text, text, numeric);
+
 create or replace function public.record_worker_task_payment(
   p_task_id uuid,
   p_payment_method text,
   p_payment_reference text,
-  p_tax_amount numeric default 0
+  p_tax_amount numeric default 0,
+  p_manual_fx_rate numeric default null
 )
 returns uuid
 language plpgsql
@@ -202,14 +260,27 @@ declare
   task_row public.tasks%rowtype;
   worker_user_id uuid;
   hotel_currency char(3);
+  hotel_vat_registered boolean;
   worker_organization_id uuid;
+  worker_currency char(3);
+  worker_vat_registered boolean;
+  fx_row record;
+  applied_rate numeric;
+  applied_source text;
+  applied_fetched_at timestamptz;
   vat_amount numeric := coalesce(p_tax_amount, 0);
+  converted_total numeric;
+  converted_vat numeric;
+  hotel_recoverable boolean;
   worker_name text;
   worker_contact_id uuid;
   reference_text text := nullif(trim(p_payment_reference), '');
   payment_id uuid;
   expense_id uuid;
   journal_id uuid;
+  cash_account_id uuid;
+  revenue_account_id uuid;
+  vat_account_id uuid;
 begin
   if auth.uid() is null then raise exception 'Sign in to record payments'; end if;
   if reference_text is null then raise exception 'A payment reference is required'; end if;
@@ -234,6 +305,9 @@ begin
   if vat_amount < 0 or vat_amount >= task_row.final_amount then
     raise exception 'VAT must be zero or less than the payment amount';
   end if;
+  if p_manual_fx_rate is not null and p_manual_fx_rate <= 0 then
+    raise exception 'Manual FX rate must be greater than zero';
+  end if;
   if exists (select 1 from public.worker_task_payments where task_id = task_row.id) then
     raise exception 'Payment is already recorded for this task';
   end if;
@@ -244,16 +318,50 @@ begin
     from public.user_profiles profile where profile.id = task_row.assigned_to;
   if worker_user_id is null then raise exception 'Assigned worker profile not found'; end if;
 
-  select base_currency into hotel_currency
-    from public.books_organizations where id = task_row.organization_id;
+  select organization.base_currency, organization.vat_registered
+    into hotel_currency, hotel_vat_registered
+    from public.books_organizations organization
+   where organization.id = task_row.organization_id;
 
   worker_organization_id := public.ensure_worker_books_organization(worker_user_id, hotel_currency);
+  select organization.base_currency, organization.vat_registered
+    into worker_currency, worker_vat_registered
+    from public.books_organizations organization
+   where organization.id = worker_organization_id;
+
+  select * into fx_row from public.books_task_payment_fx_rate(hotel_currency, worker_currency);
+  if fx_row.rate_status in ('same_currency', 'stored') then
+    applied_rate := fx_row.fx_rate;
+    applied_source := fx_row.rate_status;
+    applied_fetched_at := fx_row.rate_fetched_at;
+  elsif p_manual_fx_rate is not null then
+    applied_rate := p_manual_fx_rate;
+    applied_source := 'manual';
+    applied_fetched_at := null;
+  elsif fx_row.rate_status = 'stale' then
+    raise exception 'FX_RATE_STALE: The stored % to % rate is older than 7 days. Enter a manual rate to record this payment.',
+      hotel_currency, worker_currency;
+  else
+    raise exception 'FX_RATE_MISSING: No stored % to % rate exists. Enter a manual rate to record this payment.',
+      hotel_currency, worker_currency;
+  end if;
+
+  converted_total := round(task_row.final_amount * applied_rate, public.checkout_currency_minor_units(worker_currency));
+  converted_vat := case
+    when worker_vat_registered then round(vat_amount * applied_rate, public.checkout_currency_minor_units(worker_currency))
+    else 0
+  end;
+  if converted_total <= 0 then raise exception 'Converted payment amount is zero'; end if;
 
   insert into public.worker_task_payments (
     task_id, hotel_organization_id, worker_user_id, amount, tax_amount, currency_code,
+    worker_currency_code, fx_rate, fx_rate_source, fx_rate_fetched_at,
+    converted_amount, converted_tax_amount,
     payment_method, payment_reference, recorded_by
   ) values (
     task_row.id, task_row.organization_id, worker_user_id, task_row.final_amount, vat_amount, hotel_currency,
+    worker_currency, applied_rate, applied_source, applied_fetched_at,
+    converted_total, converted_vat,
     p_payment_method, reference_text, auth.uid()
   )
   returning id into payment_id;
@@ -270,25 +378,46 @@ begin
     returning id into worker_contact_id;
   end if;
 
+  hotel_recoverable := coalesce(hotel_vat_registered, false) and vat_amount > 0;
+  if hotel_recoverable then
+    insert into public.books_accounts (organization_id, code, name, type, is_system)
+    values (task_row.organization_id, '1400', 'Input VAT recoverable', 'asset', true)
+    on conflict (organization_id, code) do nothing;
+  end if;
+
   insert into public.books_expenses (
-    organization_id, contact_id, description, expense_date, currency_code, amount, tax_amount, payment_status
+    organization_id, contact_id, description, expense_date, currency_code, amount, tax_amount,
+    vat_recoverable, payment_status
   ) values (
     task_row.organization_id, worker_contact_id, 'Worker payment: ' || task_row.title, current_date,
-    hotel_currency, task_row.final_amount - vat_amount, vat_amount, 'paid'
+    hotel_currency, task_row.final_amount - vat_amount, vat_amount, hotel_recoverable, 'paid'
   )
   returning id into expense_id;
 
-  journal_id := public.post_books_journal_entry(
+  select account.id into cash_account_id from public.books_accounts account
+   where account.organization_id = worker_organization_id and account.code = '1000';
+  select account.id into revenue_account_id from public.books_accounts account
+   where account.organization_id = worker_organization_id and account.code = '4000';
+  select account.id into vat_account_id from public.books_accounts account
+   where account.organization_id = worker_organization_id and account.code = '2100';
+  if cash_account_id is null or revenue_account_id is null or (converted_vat > 0 and vat_account_id is null) then
+    raise exception 'Required worker Books account is missing';
+  end if;
+
+  insert into public.books_journal_transactions (
+    organization_id, source_type, source_id, transaction_date, description, created_by
+  ) values (
     worker_organization_id, 'worker_task_payment', payment_id, current_date,
-    'Task payment received: ' || task_row.title,
-    '1000', '4000', task_row.final_amount - vat_amount, hotel_currency, worker_user_id
-  );
-  if vat_amount > 0 then
-    perform public.post_books_journal_entry(
-      worker_organization_id, 'worker_task_payment_vat', payment_id, current_date,
-      'VAT on task payment: ' || task_row.title,
-      '1000', '2100', vat_amount, hotel_currency, worker_user_id
-    );
+    'Task payment received: ' || task_row.title, worker_user_id
+  )
+  returning id into journal_id;
+
+  insert into public.books_journal_lines (transaction_id, account_id, debit, credit, currency_code, exchange_rate)
+  values (journal_id, cash_account_id, converted_total, 0, worker_currency, 1),
+         (journal_id, revenue_account_id, 0, converted_total - converted_vat, worker_currency, 1);
+  if converted_vat > 0 then
+    insert into public.books_journal_lines (transaction_id, account_id, debit, credit, currency_code, exchange_rate)
+    values (journal_id, vat_account_id, 0, converted_vat, worker_currency, 1);
   end if;
 
   update public.worker_task_payments
@@ -306,8 +435,8 @@ begin
 end;
 $$;
 
-revoke all on function public.record_worker_task_payment(uuid, text, text, numeric) from public, anon;
-grant execute on function public.record_worker_task_payment(uuid, text, text, numeric) to authenticated;
+revoke all on function public.record_worker_task_payment(uuid, text, text, numeric, numeric) from public, anon;
+grant execute on function public.record_worker_task_payment(uuid, text, text, numeric, numeric) to authenticated;
 
 create or replace function public.conclude_negotiation(task_id_param uuid, provider_id_param uuid, final_price_param numeric default null::numeric, final_timeline_param character varying default null::character varying, final_notes_param text default null::text)
 returns void
