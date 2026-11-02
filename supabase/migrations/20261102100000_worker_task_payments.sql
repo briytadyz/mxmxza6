@@ -1,0 +1,263 @@
+alter table public.tasks add column if not exists final_amount numeric(20,4) check (final_amount >= 0);
+
+update public.tasks t
+   set final_amount = coalesce(
+     (select n.final_price from public.task_negotiation_status n where n.task_id = t.id),
+     (select p.quoted_price from public.task_proposals p
+       where p.task_id = t.id and p.status = 'accepted'
+       order by p.created_at desc limit 1),
+     t.budget
+   )
+ where t.final_amount is null and t.assigned_to is not null;
+
+create or replace function public.sync_task_final_amount_from_response()
+returns trigger language plpgsql security definer set search_path = pg_catalog, public
+as $$
+begin
+  if new.action = 'accept' then
+    update public.tasks set final_amount = budget where id = new.task_id;
+  end if;
+  return new;
+end;
+$$;
+
+drop trigger if exists sync_task_final_amount_on_response on public.task_responses;
+create trigger sync_task_final_amount_on_response
+after insert or update of action on public.task_responses
+for each row execute function public.sync_task_final_amount_from_response();
+
+create or replace function public.sync_task_final_amount_from_proposal()
+returns trigger language plpgsql security definer set search_path = pg_catalog, public
+as $$
+begin
+  if new.status = 'accepted' then
+    update public.tasks set final_amount = coalesce(new.quoted_price, budget) where id = new.task_id;
+  end if;
+  return new;
+end;
+$$;
+
+drop trigger if exists sync_task_final_amount_on_proposal on public.task_proposals;
+create trigger sync_task_final_amount_on_proposal
+after insert or update of status, quoted_price on public.task_proposals
+for each row execute function public.sync_task_final_amount_from_proposal();
+
+create or replace function public.sync_task_final_amount_from_negotiation()
+returns trigger language plpgsql security definer set search_path = pg_catalog, public
+as $$
+begin
+  if new.final_price is not null then
+    update public.tasks set final_amount = new.final_price where id = new.task_id;
+  end if;
+  return new;
+end;
+$$;
+
+drop trigger if exists sync_task_final_amount_on_negotiation on public.task_negotiation_status;
+create trigger sync_task_final_amount_on_negotiation
+after insert or update of final_price on public.task_negotiation_status
+for each row execute function public.sync_task_final_amount_from_negotiation();
+
+create table if not exists public.worker_task_payments (
+  id uuid primary key default gen_random_uuid(),
+  task_id uuid not null unique references public.tasks(id) on delete restrict,
+  hotel_organization_id uuid not null references public.books_organizations(id) on delete restrict,
+  worker_user_id uuid not null references auth.users(id) on delete restrict,
+  amount numeric(20,4) not null check (amount > 0),
+  currency_code char(3) not null,
+  payment_method text not null check (payment_method in ('cash', 'bank_transfer', 'mobile_money', 'card', 'other')),
+  payment_reference text not null,
+  paid_at timestamptz not null default now(),
+  recorded_by uuid not null references auth.users(id) on delete restrict,
+  hotel_expense_id uuid references public.books_expenses(id) on delete restrict,
+  worker_journal_transaction_id uuid references public.books_journal_transactions(id) on delete restrict,
+  created_at timestamptz not null default now()
+);
+
+alter table public.worker_task_payments enable row level security;
+revoke all on public.worker_task_payments from public, anon, authenticated;
+grant select on public.worker_task_payments to authenticated;
+
+drop policy if exists "Hotel managers read worker task payments" on public.worker_task_payments;
+create policy "Hotel managers read worker task payments"
+on public.worker_task_payments for select to authenticated
+using (public.hotel_user_manages_organization(hotel_organization_id, auth.uid()));
+
+drop policy if exists "Workers read own task payments" on public.worker_task_payments;
+create policy "Workers read own task payments"
+on public.worker_task_payments for select to authenticated
+using (worker_user_id = auth.uid());
+
+create or replace function public.ensure_worker_books_organization(target_user_id uuid)
+returns uuid
+language plpgsql
+security definer
+set search_path = pg_catalog, public
+as $$
+declare
+  worker_organization_id uuid;
+  worker_profile record;
+  registered_business_name text;
+begin
+  perform pg_advisory_xact_lock(hashtextextended('worker-books:' || target_user_id::text, 0));
+  select workspace.organization_id into worker_organization_id
+    from public.books_worker_workspaces workspace
+   where workspace.user_id = target_user_id;
+  if worker_organization_id is not null then return worker_organization_id; end if;
+
+  select profile.role, profile.first_name, profile.last_name, profile.buyer_business_name
+    into worker_profile
+    from public.user_profiles profile
+   where profile.user_id = target_user_id;
+  if worker_profile.role is distinct from 'worker' then
+    raise exception 'Worker Books are available to worker accounts';
+  end if;
+
+  registered_business_name := nullif(trim(worker_profile.buyer_business_name), '');
+
+  insert into public.books_organizations (name, owner_id, tax_entity_type)
+  values (
+    coalesce(
+      registered_business_name,
+      nullif(trim(concat_ws(' ', worker_profile.first_name, worker_profile.last_name)), ''),
+      'Worker Books'
+    ),
+    target_user_id,
+    case when registered_business_name is null then 'sole_proprietor' end
+  )
+  returning id into worker_organization_id;
+
+  insert into public.books_memberships (organization_id, user_id, role)
+  values (worker_organization_id, target_user_id, 'owner');
+
+  insert into public.books_accounts (organization_id, code, name, type, is_system) values
+    (worker_organization_id, '1000', 'Cash and bank', 'asset', true),
+    (worker_organization_id, '1100', 'Accounts receivable', 'asset', true),
+    (worker_organization_id, '2000', 'Accounts payable', 'liability', true),
+    (worker_organization_id, '3000', 'Owner equity', 'equity', true),
+    (worker_organization_id, '4000', 'Sales revenue', 'income', true),
+    (worker_organization_id, '5000', 'Operating expenses', 'expense', true)
+  on conflict (organization_id, code) do nothing;
+
+  perform public.seed_books_tax_rates(worker_organization_id);
+
+  insert into public.books_worker_workspaces (user_id, organization_id)
+  values (target_user_id, worker_organization_id);
+
+  return worker_organization_id;
+end;
+$$;
+revoke all on function public.ensure_worker_books_organization(uuid) from public, anon, authenticated;
+
+create or replace function public.get_or_create_worker_books_organization()
+returns uuid
+language plpgsql
+security definer
+set search_path = pg_catalog, public
+as $$
+begin
+  if auth.uid() is null then raise exception 'Sign in to access Books'; end if;
+  return public.ensure_worker_books_organization(auth.uid());
+end;
+$$;
+revoke all on function public.get_or_create_worker_books_organization() from public, anon;
+grant execute on function public.get_or_create_worker_books_organization() to authenticated;
+
+create or replace function public.record_worker_task_payment(
+  p_task_id uuid,
+  p_payment_method text,
+  p_payment_reference text
+)
+returns uuid
+language plpgsql
+security definer
+set search_path = pg_catalog, public
+as $$
+declare
+  task_row public.tasks%rowtype;
+  worker_user_id uuid;
+  hotel_currency char(3);
+  worker_currency char(3);
+  worker_organization_id uuid;
+  reference_text text := nullif(trim(p_payment_reference), '');
+  payment_id uuid;
+  expense_id uuid;
+  journal_id uuid;
+begin
+  if auth.uid() is null then raise exception 'Sign in to record payments'; end if;
+  if reference_text is null then raise exception 'A payment reference is required'; end if;
+
+  select * into task_row from public.tasks where id = p_task_id for update;
+  if not found then raise exception 'Task not found'; end if;
+  if task_row.organization_id is null
+     or not public.hotel_user_manages_organization(task_row.organization_id, auth.uid()) then
+    raise exception 'Only this hotel''s manager can record task payments';
+  end if;
+  if task_row.status <> 'completed' then raise exception 'Task must be approved before payment'; end if;
+  if not exists (
+    select 1 from public.task_reports report
+     where report.task_id = task_row.id and report.status = 'approved'
+  ) then
+    raise exception 'Task report must be approved before payment';
+  end if;
+  if task_row.final_amount is null or task_row.final_amount <= 0 then
+    raise exception 'Task has no agreed amount';
+  end if;
+  if task_row.assigned_to is null then raise exception 'Task has no assigned worker'; end if;
+  if exists (select 1 from public.worker_task_payments where task_id = task_row.id) then
+    raise exception 'Payment is already recorded for this task';
+  end if;
+
+  select profile.user_id into worker_user_id
+    from public.user_profiles profile where profile.id = task_row.assigned_to;
+
+  select base_currency into hotel_currency
+    from public.books_organizations where id = task_row.organization_id;
+
+  worker_organization_id := public.ensure_worker_books_organization(worker_user_id);
+  select base_currency into worker_currency
+    from public.books_organizations where id = worker_organization_id;
+  if worker_currency is distinct from hotel_currency then
+    raise exception 'Worker Business Books currency must match the hotel Books currency';
+  end if;
+
+  insert into public.worker_task_payments (
+    task_id, hotel_organization_id, worker_user_id, amount, currency_code,
+    payment_method, payment_reference, recorded_by
+  ) values (
+    task_row.id, task_row.organization_id, worker_user_id, task_row.final_amount, hotel_currency,
+    p_payment_method, reference_text, auth.uid()
+  )
+  returning id into payment_id;
+
+  insert into public.books_expenses (
+    organization_id, description, expense_date, currency_code, amount, tax_amount, payment_status
+  ) values (
+    task_row.organization_id, 'Worker payment: ' || task_row.title, current_date,
+    hotel_currency, task_row.final_amount, 0, 'paid'
+  )
+  returning id into expense_id;
+
+  journal_id := public.post_books_journal_entry(
+    worker_organization_id, 'worker_task_payment', payment_id, current_date,
+    'Task payment received: ' || task_row.title,
+    '1000', '4000', task_row.final_amount, hotel_currency, worker_user_id
+  );
+
+  update public.worker_task_payments
+     set hotel_expense_id = expense_id,
+         worker_journal_transaction_id = journal_id
+   where id = payment_id;
+
+  insert into public.notifications (user_id, task_id, type, message)
+  values (
+    worker_user_id, task_row.id, 'task_updated',
+    'Payment recorded for "' || task_row.title || '". Reference: ' || reference_text
+  );
+
+  return payment_id;
+end;
+$$;
+
+revoke all on function public.record_worker_task_payment(uuid, text, text) from public, anon;
+grant execute on function public.record_worker_task_payment(uuid, text, text) to authenticated;
