@@ -109,8 +109,6 @@ create policy "Workers read own task payments"
 on public.worker_task_payments for select to authenticated
 using (worker_user_id = auth.uid());
 
-drop function if exists public.ensure_worker_books_organization(uuid);
-
 create or replace function public.ensure_worker_books_organization(target_user_id uuid, org_currency char(3) default null)
 returns uuid
 language plpgsql
@@ -170,8 +168,6 @@ begin
     (worker_organization_id, '4000', 'Sales revenue', 'income', true),
     (worker_organization_id, '5000', 'Operating expenses', 'expense', true)
   on conflict (organization_id, code) do nothing;
-
-  perform public.seed_books_tax_rates(worker_organization_id);
 
   insert into public.books_worker_workspaces (user_id, organization_id)
   values (target_user_id, worker_organization_id);
