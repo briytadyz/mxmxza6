@@ -98,6 +98,7 @@ declare
   worker_organization_id uuid;
   worker_profile record;
   registered_business_name text;
+  worker_entity_type text;
 begin
   perform pg_advisory_xact_lock(hashtextextended('worker-books:' || target_user_id::text, 0));
   select workspace.organization_id into worker_organization_id
@@ -105,7 +106,7 @@ begin
    where workspace.user_id = target_user_id;
   if worker_organization_id is not null then return worker_organization_id; end if;
 
-  select profile.role, profile.first_name, profile.last_name, profile.buyer_business_name
+  select profile.role, profile.first_name, profile.last_name, profile.buyer_business_name, profile.tax_entity_type
     into worker_profile
     from public.user_profiles profile
    where profile.user_id = target_user_id;
@@ -114,6 +115,10 @@ begin
   end if;
 
   registered_business_name := nullif(trim(worker_profile.buyer_business_name), '');
+  worker_entity_type := coalesce(
+    worker_profile.tax_entity_type,
+    case when registered_business_name is null then 'sole_proprietor' end
+  );
 
   insert into public.books_organizations (name, owner_id, tax_entity_type)
   values (
@@ -123,7 +128,7 @@ begin
       'Worker Books'
     ),
     target_user_id,
-    case when registered_business_name is null then 'sole_proprietor' end
+    worker_entity_type
   )
   returning id into worker_organization_id;
 
@@ -139,10 +144,13 @@ begin
     (worker_organization_id, '5000', 'Operating expenses', 'expense', true)
   on conflict (organization_id, code) do nothing;
 
-  perform public.seed_books_tax_rates(worker_organization_id);
-
   insert into public.books_worker_workspaces (user_id, organization_id)
   values (target_user_id, worker_organization_id);
+
+  update public.user_profiles profile
+     set tax_entity_type = worker_entity_type
+   where profile.user_id = target_user_id
+     and profile.tax_entity_type is distinct from worker_entity_type;
 
   return worker_organization_id;
 end;
@@ -261,3 +269,78 @@ $$;
 
 revoke all on function public.record_worker_task_payment(uuid, text, text) from public, anon;
 grant execute on function public.record_worker_task_payment(uuid, text, text) to authenticated;
+
+create or replace function public.conclude_negotiation(task_id_param uuid, provider_id_param uuid, final_price_param numeric default null::numeric, final_timeline_param character varying default null::character varying, final_notes_param text default null::text)
+returns void
+language plpgsql
+as $function$
+declare
+  v_task_record tasks%rowtype;
+  v_proposal_record task_proposals%rowtype;
+begin
+  select * into v_task_record from tasks where id = task_id_param;
+
+  if not found then
+    raise exception 'Task not found: %', task_id_param;
+  end if;
+
+  select * into v_proposal_record from task_proposals
+  where task_id = task_id_param and worker_id = provider_id_param
+  order by created_at desc limit 1;
+
+  insert into public.task_negotiation_status (task_id, status, final_price, final_timeline, final_notes)
+  values (task_id_param, 'agreed', final_price_param, final_timeline_param, final_notes_param)
+  on conflict (task_id) do update set
+    status = 'agreed',
+    final_price = coalesce(final_price_param, task_negotiation_status.final_price),
+    final_timeline = final_timeline_param,
+    final_notes = final_notes_param,
+    updated_at = now();
+
+  insert into public.todo_list (
+    task_id,
+    worker_id,
+    title,
+    description,
+    priority,
+    due_date,
+    details,
+    status
+  )
+  values (
+    task_id_param,
+    provider_id_param,
+    v_task_record.title,
+    v_task_record.description,
+    v_task_record.priority,
+    v_task_record.due_date,
+    jsonb_build_object(
+      'category', v_task_record.category,
+      'estimated_time', v_task_record.estimated_time,
+      'payment_terms', v_task_record.payment_terms,
+      'budget', v_task_record.budget,
+      'agreed_price', coalesce(final_price_param, v_proposal_record.quoted_price, v_task_record.budget),
+      'agreed_timeline', coalesce(final_timeline_param, v_proposal_record.proposed_timeline, v_task_record.estimated_time),
+      'final_notes', final_notes_param
+    ),
+    'pending'::character varying
+  )
+  on conflict do nothing;
+
+  insert into public.notifications (user_id, task_id, type, message)
+  select
+    up.user_id,
+    task_id_param,
+    'todo_created'::character varying,
+    'Negotiation complete! A todo has been created with the final agreed terms.'
+  from user_profiles up
+  where up.id = provider_id_param;
+
+  update public.task_negotiation_status
+  set status = 'concluded', updated_at = now()
+  where task_id = task_id_param;
+
+end;
+$function$;
+
+notify pgrst, 'reload schema';

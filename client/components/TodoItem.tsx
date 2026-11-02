@@ -1,4 +1,4 @@
-import React, { useState } from "react";
+import React, { useEffect, useState } from "react";
 import {
   Card,
   CardContent,
@@ -15,7 +15,7 @@ import {
   SelectValue,
 } from "./ui/select";
 import { Loader, CheckCircle, AlertCircle, Clock } from "lucide-react";
-import { supabase, TodoListItem } from "../lib/supabase";
+import { supabase, TodoListItem, WorkerTaskPayment } from "../lib/supabase";
 import { toast } from "../hooks/use-toast";
 import AttachmentList from "./AttachmentList";
 
@@ -48,6 +48,22 @@ export const TodoItem: React.FC<TodoItemProps> = ({
 }) => {
   const [isUpdating, setIsUpdating] = useState(false);
   const [status, setStatus] = useState(todo.status);
+  const [payment, setPayment] = useState<WorkerTaskPayment | null>(null);
+
+  useEffect(() => {
+    let isActive = true;
+    supabase
+      .from("worker_task_payments")
+      .select("amount, currency_code, payment_method, payment_reference, paid_at")
+      .eq("task_id", todo.task_id)
+      .maybeSingle()
+      .then(({ data }) => {
+        if (isActive) setPayment(data ?? null);
+      });
+    return () => {
+      isActive = false;
+    };
+  }, [todo.task_id]);
 
   const getPriorityColor = (priority: string) => {
     switch (priority) {
@@ -307,6 +323,15 @@ export const TodoItem: React.FC<TodoItemProps> = ({
             <p className="text-green-800 font-semibold">
               ✓ Completed on {new Date(todo.completed_at).toLocaleDateString()}
             </p>
+          </div>
+        )}
+
+        {payment && (
+          <div className="p-3 bg-green-100/50 rounded border border-green-300 text-sm space-y-1">
+            <p className="text-green-800 font-semibold">
+              Paid {payment.amount.toLocaleString()} {payment.currency_code} on {new Date(payment.paid_at).toLocaleDateString()}
+            </p>
+            <p className="text-green-800">Reference: {payment.payment_reference}</p>
           </div>
         )}
       </CardContent>
