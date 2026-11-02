@@ -20,14 +20,17 @@ const TaskPaymentPanel: React.FC<TaskPaymentPanelProps> = ({ task }) => {
   const [isSaving, setIsSaving] = useState(false);
   const [method, setMethod] = useState<WorkerTaskPayment["payment_method"]>("bank_transfer");
   const [reference, setReference] = useState("");
+  const [vatInput, setVatInput] = useState("");
 
   const agreedAmount = task.final_amount ?? 0;
   const hasAgreedAmount = agreedAmount > 0;
+  const vatAmount = vatInput.trim() === "" ? 0 : Number(vatInput);
+  const isVatValid = Number.isFinite(vatAmount) && vatAmount >= 0 && vatAmount < agreedAmount;
 
   const loadPayment = async () => {
     const { data, error } = await supabase
       .from("worker_task_payments")
-      .select("amount, currency_code, payment_method, payment_reference, paid_at")
+      .select("amount, tax_amount, currency_code, payment_method, payment_reference, paid_at")
       .eq("task_id", task.id)
       .maybeSingle();
     if (error) {
@@ -48,11 +51,16 @@ const TaskPaymentPanel: React.FC<TaskPaymentPanelProps> = ({ task }) => {
       toast({ title: "Reference required", description: "Enter the payment reference before recording.", variant: "destructive" });
       return;
     }
+    if (!isVatValid) {
+      toast({ title: "Invalid VAT", description: "VAT must be zero or less than the agreed amount.", variant: "destructive" });
+      return;
+    }
     setIsSaving(true);
     const { error } = await supabase.rpc("record_worker_task_payment", {
       p_task_id: task.id,
       p_payment_method: method,
       p_payment_reference: trimmedReference,
+      p_tax_amount: vatAmount,
     });
     setIsSaving(false);
     if (error) {
@@ -61,6 +69,7 @@ const TaskPaymentPanel: React.FC<TaskPaymentPanelProps> = ({ task }) => {
     }
     toast({ title: "Payment recorded", description: "Posted to the hotel and worker Books." });
     setReference("");
+    setVatInput("");
     void loadPayment();
   };
 
@@ -81,6 +90,9 @@ const TaskPaymentPanel: React.FC<TaskPaymentPanelProps> = ({ task }) => {
           <p className="font-semibold">
             Paid {payment.amount.toLocaleString()} {payment.currency_code} on {new Date(payment.paid_at).toLocaleDateString()}
           </p>
+          {payment.tax_amount > 0 && (
+            <p>VAT included: {payment.tax_amount.toLocaleString()} {payment.currency_code}</p>
+          )}
           <p>Method: {PAYMENT_METHODS.find((item) => item.value === payment.payment_method)?.label ?? payment.payment_method}</p>
           <p>Reference: {payment.payment_reference}</p>
         </div>
@@ -102,6 +114,21 @@ const TaskPaymentPanel: React.FC<TaskPaymentPanelProps> = ({ task }) => {
             </select>
           </div>
           <div>
+            <label htmlFor="worker-payment-vat" className="block text-sm font-medium text-gray-700 mb-1">
+              VAT included in agreed amount (optional)
+            </label>
+            <input
+              id="worker-payment-vat"
+              type="number"
+              min="0"
+              step="any"
+              value={vatInput}
+              onChange={(event) => setVatInput(event.target.value)}
+              placeholder="0"
+              className="w-full px-3 py-2 border border-gray-300 rounded-lg"
+            />
+          </div>
+          <div>
             <label htmlFor="worker-payment-reference" className="block text-sm font-medium text-gray-700 mb-1">
               Payment reference
             </label>
@@ -117,7 +144,7 @@ const TaskPaymentPanel: React.FC<TaskPaymentPanelProps> = ({ task }) => {
           <button
             type="button"
             onClick={() => void handleRecordPayment()}
-            disabled={!hasAgreedAmount || isSaving || !reference.trim()}
+            disabled={!hasAgreedAmount || isSaving || !reference.trim() || !isVatValid}
             className="px-4 py-2 bg-sheraton-gold text-sheraton-navy rounded-lg font-semibold disabled:opacity-50"
           >
             {isSaving ? "Recording..." : "Record payment"}

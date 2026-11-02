@@ -54,7 +54,7 @@ export const TodoItem: React.FC<TodoItemProps> = ({
     let isActive = true;
     supabase
       .from("worker_task_payments")
-      .select("amount, currency_code, payment_method, payment_reference, paid_at")
+      .select("amount, tax_amount, currency_code, payment_method, payment_reference, paid_at")
       .eq("task_id", todo.task_id)
       .maybeSingle()
       .then(({ data }) => {

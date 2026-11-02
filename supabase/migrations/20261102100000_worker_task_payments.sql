@@ -64,6 +64,7 @@ create table if not exists public.worker_task_payments (
   hotel_organization_id uuid not null references public.books_organizations(id) on delete restrict,
   worker_user_id uuid not null references auth.users(id) on delete restrict,
   amount numeric(20,4) not null check (amount > 0),
+  tax_amount numeric(20,4) not null default 0 check (tax_amount >= 0 and tax_amount < amount),
   currency_code char(3) not null,
   payment_method text not null check (payment_method in ('cash', 'bank_transfer', 'mobile_money', 'card', 'other')),
   payment_reference text not null,
@@ -88,7 +89,7 @@ create policy "Workers read own task payments"
 on public.worker_task_payments for select to authenticated
 using (worker_user_id = auth.uid());
 
-create or replace function public.ensure_worker_books_organization(target_user_id uuid)
+create or replace function public.ensure_worker_books_organization(target_user_id uuid, org_currency char(3) default null)
 returns uuid
 language plpgsql
 security definer
@@ -99,12 +100,25 @@ declare
   worker_profile record;
   registered_business_name text;
   worker_entity_type text;
+  existing_currency char(3);
 begin
   perform pg_advisory_xact_lock(hashtextextended('worker-books:' || target_user_id::text, 0));
   select workspace.organization_id into worker_organization_id
     from public.books_worker_workspaces workspace
    where workspace.user_id = target_user_id;
-  if worker_organization_id is not null then return worker_organization_id; end if;
+  if worker_organization_id is not null then
+    select organization.base_currency into existing_currency
+      from public.books_organizations organization where organization.id = worker_organization_id;
+    if org_currency is not null and existing_currency is distinct from org_currency then
+      if exists (select 1 from public.books_journal_transactions where organization_id = worker_organization_id)
+         or exists (select 1 from public.books_expenses where organization_id = worker_organization_id)
+         or exists (select 1 from public.books_invoices where organization_id = worker_organization_id) then
+        raise exception 'Worker Business Books already has transactions in %', existing_currency;
+      end if;
+      update public.books_organizations set base_currency = org_currency where id = worker_organization_id;
+    end if;
+    return worker_organization_id;
+  end if;
 
   select profile.role, profile.first_name, profile.last_name, profile.buyer_business_name, profile.tax_entity_type
     into worker_profile
@@ -120,7 +134,7 @@ begin
     case when registered_business_name is null then 'sole_proprietor' end
   );
 
-  insert into public.books_organizations (name, owner_id, tax_entity_type)
+  insert into public.books_organizations (name, owner_id, tax_entity_type, base_currency)
   values (
     coalesce(
       registered_business_name,
@@ -128,7 +142,8 @@ begin
       'Worker Books'
     ),
     target_user_id,
-    worker_entity_type
+    worker_entity_type,
+    coalesce(org_currency, 'UGX')
   )
   returning id into worker_organization_id;
 
@@ -139,6 +154,7 @@ begin
     (worker_organization_id, '1000', 'Cash and bank', 'asset', true),
     (worker_organization_id, '1100', 'Accounts receivable', 'asset', true),
     (worker_organization_id, '2000', 'Accounts payable', 'liability', true),
+    (worker_organization_id, '2100', 'VAT payable', 'liability', true),
     (worker_organization_id, '3000', 'Owner equity', 'equity', true),
     (worker_organization_id, '4000', 'Sales revenue', 'income', true),
     (worker_organization_id, '5000', 'Operating expenses', 'expense', true)
@@ -155,7 +171,7 @@ begin
   return worker_organization_id;
 end;
 $$;
-revoke all on function public.ensure_worker_books_organization(uuid) from public, anon, authenticated;
+revoke all on function public.ensure_worker_books_organization(uuid, char(3)) from public, anon, authenticated;
 
 create or replace function public.get_or_create_worker_books_organization()
 returns uuid
@@ -174,7 +190,8 @@ grant execute on function public.get_or_create_worker_books_organization() to au
 create or replace function public.record_worker_task_payment(
   p_task_id uuid,
   p_payment_method text,
-  p_payment_reference text
+  p_payment_reference text,
+  p_tax_amount numeric default 0
 )
 returns uuid
 language plpgsql
@@ -185,8 +202,10 @@ declare
   task_row public.tasks%rowtype;
   worker_user_id uuid;
   hotel_currency char(3);
-  worker_currency char(3);
   worker_organization_id uuid;
+  vat_amount numeric := coalesce(p_tax_amount, 0);
+  worker_name text;
+  worker_contact_id uuid;
   reference_text text := nullif(trim(p_payment_reference), '');
   payment_id uuid;
   expense_id uuid;
@@ -212,45 +231,65 @@ begin
     raise exception 'Task has no agreed amount';
   end if;
   if task_row.assigned_to is null then raise exception 'Task has no assigned worker'; end if;
+  if vat_amount < 0 or vat_amount >= task_row.final_amount then
+    raise exception 'VAT must be zero or less than the payment amount';
+  end if;
   if exists (select 1 from public.worker_task_payments where task_id = task_row.id) then
     raise exception 'Payment is already recorded for this task';
   end if;
 
-  select profile.user_id into worker_user_id
+  select profile.user_id,
+         coalesce(nullif(trim(concat_ws(' ', profile.first_name, profile.last_name)), ''), 'Worker')
+    into worker_user_id, worker_name
     from public.user_profiles profile where profile.id = task_row.assigned_to;
+  if worker_user_id is null then raise exception 'Assigned worker profile not found'; end if;
 
   select base_currency into hotel_currency
     from public.books_organizations where id = task_row.organization_id;
 
-  worker_organization_id := public.ensure_worker_books_organization(worker_user_id);
-  select base_currency into worker_currency
-    from public.books_organizations where id = worker_organization_id;
-  if worker_currency is distinct from hotel_currency then
-    raise exception 'Worker Business Books currency must match the hotel Books currency';
-  end if;
+  worker_organization_id := public.ensure_worker_books_organization(worker_user_id, hotel_currency);
 
   insert into public.worker_task_payments (
-    task_id, hotel_organization_id, worker_user_id, amount, currency_code,
+    task_id, hotel_organization_id, worker_user_id, amount, tax_amount, currency_code,
     payment_method, payment_reference, recorded_by
   ) values (
-    task_row.id, task_row.organization_id, worker_user_id, task_row.final_amount, hotel_currency,
+    task_row.id, task_row.organization_id, worker_user_id, task_row.final_amount, vat_amount, hotel_currency,
     p_payment_method, reference_text, auth.uid()
   )
   returning id into payment_id;
 
+  select contact.id into worker_contact_id
+    from public.books_contacts contact
+   where contact.organization_id = task_row.organization_id
+     and contact.name = worker_name
+     and contact.type in ('vendor', 'both')
+   limit 1;
+  if worker_contact_id is null then
+    insert into public.books_contacts (organization_id, name, type)
+    values (task_row.organization_id, worker_name, 'vendor')
+    returning id into worker_contact_id;
+  end if;
+
   insert into public.books_expenses (
-    organization_id, description, expense_date, currency_code, amount, tax_amount, payment_status
+    organization_id, contact_id, description, expense_date, currency_code, amount, tax_amount, payment_status
   ) values (
-    task_row.organization_id, 'Worker payment: ' || task_row.title, current_date,
-    hotel_currency, task_row.final_amount, 0, 'paid'
+    task_row.organization_id, worker_contact_id, 'Worker payment: ' || task_row.title, current_date,
+    hotel_currency, task_row.final_amount - vat_amount, vat_amount, 'paid'
   )
   returning id into expense_id;
 
   journal_id := public.post_books_journal_entry(
     worker_organization_id, 'worker_task_payment', payment_id, current_date,
     'Task payment received: ' || task_row.title,
-    '1000', '4000', task_row.final_amount, hotel_currency, worker_user_id
+    '1000', '4000', task_row.final_amount - vat_amount, hotel_currency, worker_user_id
   );
+  if vat_amount > 0 then
+    perform public.post_books_journal_entry(
+      worker_organization_id, 'worker_task_payment_vat', payment_id, current_date,
+      'VAT on task payment: ' || task_row.title,
+      '1000', '2100', vat_amount, hotel_currency, worker_user_id
+    );
+  end if;
 
   update public.worker_task_payments
      set hotel_expense_id = expense_id,
@@ -267,8 +306,8 @@ begin
 end;
 $$;
 
-revoke all on function public.record_worker_task_payment(uuid, text, text) from public, anon;
-grant execute on function public.record_worker_task_payment(uuid, text, text) to authenticated;
+revoke all on function public.record_worker_task_payment(uuid, text, text, numeric) from public, anon;
+grant execute on function public.record_worker_task_payment(uuid, text, text, numeric) to authenticated;
 
 create or replace function public.conclude_negotiation(task_id_param uuid, provider_id_param uuid, final_price_param numeric default null::numeric, final_timeline_param character varying default null::character varying, final_notes_param text default null::text)
 returns void

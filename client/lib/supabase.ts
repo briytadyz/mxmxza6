@@ -139,6 +139,7 @@ export interface Task {
 
 export interface WorkerTaskPayment {
   amount: number
+  tax_amount: number
   currency_code: string
   payment_method: 'cash' | 'bank_transfer' | 'mobile_money' | 'card' | 'other'
   payment_reference: string
