@@ -1,4 +1,5 @@
 drop function if exists public.ensure_worker_books_organization(uuid);
+drop function if exists public.record_worker_task_payment(uuid, text, text);
 
 create or replace function public.ensure_worker_books_organization(target_user_id uuid, org_currency char(3) default null)
 returns uuid
