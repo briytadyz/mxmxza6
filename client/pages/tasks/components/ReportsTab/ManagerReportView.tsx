@@ -37,6 +37,8 @@ const ManagerReportView: React.FC<ManagerReportViewProps> = ({
   const [reviewTestimonial, setReviewTestimonial] = useState("");
   const [isReviewLoading, setIsReviewLoading] = useState(false);
   const [isReviewSaving, setIsReviewSaving] = useState(false);
+  const [approvalFxIssue, setApprovalFxIssue] = useState<string | null>(null);
+  const [approvalManualRate, setApprovalManualRate] = useState("");
   const hasApprovedReport = taskReport?.task_id === task.id && taskReport.status === "approved";
 
   useEffect(() => {
@@ -112,13 +114,29 @@ const ManagerReportView: React.FC<ManagerReportViewProps> = ({
   const handleApproveTask = async () => {
     if (!taskReport || !task.assigned_to) return;
 
+    const manualRate = approvalManualRate.trim() === "" ? null : Number(approvalManualRate);
+    if (manualRate !== null && !(Number.isFinite(manualRate) && manualRate > 0)) {
+      toast({ title: "Invalid rate", description: "The manual FX rate must be greater than zero.", variant: "destructive" });
+      return;
+    }
+
     setIsSubmitting(true);
     try {
       const { data: pointsAwarded, error } = await supabase.rpc("approve_task_report_and_award_points", {
         target_report_id: taskReport.id,
+        p_manual_fx_rate: manualRate,
       });
-      if (error) throw error;
+      if (error) {
+        if (error.message.startsWith("FX_RATE_")) {
+          setApprovalFxIssue(error.message.replace(/^FX_RATE_\w+:\s*/, ""));
+        } else {
+          toast({ title: "Error", description: error.message, variant: "destructive" });
+        }
+        return;
+      }
 
+      setApprovalFxIssue(null);
+      setApprovalManualRate("");
       toast({
         title: "Success",
         description: Number(pointsAwarded) > 0
@@ -332,9 +350,27 @@ const ManagerReportView: React.FC<ManagerReportViewProps> = ({
           <p className="text-gray-700 mb-4">
             All work appears complete. Review the report, checklist, and evidence above, then approve to mark the task as complete.
           </p>
+          {approvalFxIssue && (
+            <div className="mb-4 p-3 bg-amber-50 border border-amber-200 rounded-lg text-sm text-amber-800 space-y-2">
+              <p>{approvalFxIssue}</p>
+              <label htmlFor="approval-manual-rate" className="block font-medium">
+                Manual exchange rate (units of worker Books currency per 1 hotel currency unit)
+              </label>
+              <input
+                id="approval-manual-rate"
+                type="number"
+                min="0"
+                step="any"
+                value={approvalManualRate}
+                onChange={(event) => setApprovalManualRate(event.target.value)}
+                placeholder="e.g. 0.00027"
+                className="w-full px-3 py-2 border border-gray-300 rounded-lg bg-white"
+              />
+            </div>
+          )}
           <button
             onClick={handleApproveTask}
-            disabled={isSubmitting}
+            disabled={isSubmitting || (approvalFxIssue !== null && approvalManualRate.trim() === "")}
             className="w-full px-6 py-3 bg-sheraton-gold text-sheraton-navy rounded-lg font-semibold hover:bg-opacity-90 disabled:opacity-50"
           >
             {isSubmitting ? "Approving..." : "✓ Approve & Complete Task"}
