@@ -1793,10 +1793,11 @@ const getPlatformHotels = async (request, response) => {
   noStore(response);
   try {
     await requirePlatformAdmin(request);
-    const [organizations, settings, domains] = await Promise.all([
+    const [organizations, workerWorkspaces, settings, domains] = await Promise.all([
       readService(
         "books_organizations?select=id,name,country_code,base_currency,owner_id&order=name"
       ),
+      readService("books_worker_workspaces?select=organization_id"),
       readService(
         "hotel_tenant_settings?select=organization_id,display_name,logo_url,primary_color,accent_color,booking_title,booking_subtitle,is_active"
       ),
@@ -1804,8 +1805,9 @@ const getPlatformHotels = async (request, response) => {
         "hotel_tenant_domains?select=domain,organization_id,verification_status,verification_method,verified_at&order=domain"
       )
     ]);
+    const workerOrganizationIds = new Set(workerWorkspaces.map((workspace) => workspace.organization_id));
     response.json({
-      organizations,
+      organizations: organizations.filter((organization) => !workerOrganizationIds.has(organization.id)),
       hotels: settings.map((hotel) => ({
         ...hotel,
         domains: domains.filter((domain) => domain.organization_id === hotel.organization_id)
