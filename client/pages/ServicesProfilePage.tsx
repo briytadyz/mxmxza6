@@ -132,7 +132,7 @@ const ServicesProfilePage = () => {
   const { toast } = useToast();
   const { tenant } = useHotelTenant();
   const { rewardsBalance, setRewardsBalance } = useRewardsPoints();
-  const [activeTab, setActiveTab] = useState("dashboard");
+  const [activeTab, setActiveTab] = useState(() => new URLSearchParams(window.location.search).get("tab") === "rewards" ? "rewards" : "dashboard");
   const [isEditing, setIsEditing] = useState(false);
   const [showPerformanceDetails, setShowPerformanceDetails] = useState(false);
   const [dataLoaded, setDataLoaded] = useState(false);

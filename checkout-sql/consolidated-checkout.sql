@@ -1654,7 +1654,8 @@ begin
   select coalesce(max(discount_percentage), 0)
     into discount_rate
     from public.hotel_booking_offers
-   where is_active
+   where organization_id = selected_room.organization_id
+     and is_active
      and minimum_nights <= nights_count
      and (starts_at is null or starts_at <= now())
      and (ends_at is null or ends_at > now());
@@ -2473,7 +2474,8 @@ begin
   select coalesce(max(discount_percentage), 0)
     into discount_rate
     from public.hotel_booking_offers
-   where is_active
+   where organization_id = selected_room.organization_id
+     and is_active
      and minimum_nights <= nights_count
      and (starts_at is null or starts_at <= now())
      and (ends_at is null or ends_at > now());

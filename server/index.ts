@@ -38,6 +38,10 @@ import {
   getHotelRewards,
   updateHotelRewardsEnrollment,
   getPublicHotelBookingData,
+  getPublicHotelOffers,
+  checkHotelOfferManagementAccess,
+  getHotelOffersForManagement,
+  saveHotelOffer,
   submitHotelComplaint,
   getPublicMenuItems,
   getPublicMenuVideo,
@@ -76,6 +80,10 @@ export function createServer() {
   app.post("/api/hotel-rewards/enrollment", updateHotelRewardsEnrollment);
   app.post("/api/hotel-complaints", submitHotelComplaint);
   app.get("/api/hotel-booking-data", getPublicHotelBookingData);
+  app.get("/api/hotel-offers", getPublicHotelOffers);
+  app.get("/api/hotel-offers/manage/access", checkHotelOfferManagementAccess);
+  app.get("/api/hotel-offers/manage", getHotelOffersForManagement);
+  app.post("/api/hotel-offers/manage", saveHotelOffer);
   app.get("/api/hotel-menu-items", getPublicMenuItems);
   app.get("/api/hotel-menu-video/:attachmentId", getPublicMenuVideo);
   app.post("/api/hotel-menu-availability", requestHotelMenuAvailability);

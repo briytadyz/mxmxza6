@@ -76,6 +76,66 @@ const updateService = async (path2, body) => {
   });
   if (!response.ok) throw new Error("Menu media information could not be saved");
 };
+const hotelOfferError = (message, status) => Object.assign(new Error(message), { status });
+const writeService$1 = async (path2, method, body) => {
+  const { supabaseUrl } = configuration$2();
+  const response = await fetch(`${supabaseUrl}/rest/v1/${path2}`, {
+    method,
+    headers: { ...serviceHeaders$2(true), Prefer: "return=representation" },
+    body: JSON.stringify(body),
+    signal: AbortSignal.timeout(1e4)
+  });
+  if (!response.ok) throw hotelOfferError("Hotel offer could not be saved", 503);
+  return response.json();
+};
+const requireHotelManager = async (request) => {
+  const tenant = await resolveRequestHotelTenant(request);
+  const userId = await getAuthenticatedUserId$2(request.headers.authorization);
+  const organizationId = encodeURIComponent(tenant.organizationId);
+  const userFilter = encodeURIComponent(userId);
+  let profiles;
+  let memberships;
+  try {
+    [profiles, memberships] = await Promise.all([
+      readService$2(`user_profiles?user_id=eq.${userFilter}&select=role&limit=1`),
+      readService$2(`books_memberships?organization_id=eq.${organizationId}&user_id=eq.${userFilter}&role=in.(owner,admin)&select=role&limit=1`)
+    ]);
+  } catch {
+    throw hotelOfferError("Hotel manager access could not be verified", 503);
+  }
+  if (profiles[0]?.role !== "manager" || !memberships[0]) {
+    throw hotelOfferError("Only a hotel manager can manage offers", 403);
+  }
+  return tenant;
+};
+const validateHotelOffer = (value) => {
+  const input = value && typeof value === "object" && !Array.isArray(value) ? value : {};
+  const title = typeof input.title === "string" ? input.title.trim() : "";
+  const description = typeof input.description === "string" ? input.description.trim() : "";
+  const discountPercentage = Number(input.discount_percentage);
+  const minimumNights = Number(input.minimum_nights);
+  const displayOrder = Number(input.display_order);
+  const terms = input.terms;
+  const startsAt = input.starts_at === null || input.starts_at === "" ? null : input.starts_at;
+  const endsAt = input.ends_at === null || input.ends_at === "" ? null : input.ends_at;
+  const startsAtTimestamp = typeof startsAt === "string" ? Date.parse(startsAt) : null;
+  const endsAtTimestamp = typeof endsAt === "string" ? Date.parse(endsAt) : null;
+  if (!title || title.length > 120 || !description || description.length > 2e3 || !Number.isFinite(discountPercentage) || discountPercentage <= 0 || discountPercentage > 100 || !Number.isInteger(minimumNights) || minimumNights < 1 || !Number.isInteger(displayOrder) || displayOrder < 0 || typeof input.featured !== "boolean" || typeof input.is_active !== "boolean" || !Array.isArray(terms) || terms.length > 12 || terms.some((term) => typeof term !== "string" || !term.trim() || term.length > 300) || startsAt !== null && (typeof startsAt !== "string" || !Number.isFinite(startsAtTimestamp)) || endsAt !== null && (typeof endsAt !== "string" || !Number.isFinite(endsAtTimestamp)) || startsAtTimestamp !== null && endsAtTimestamp !== null && endsAtTimestamp <= startsAtTimestamp) {
+    throw new Error("Enter valid offer details and dates");
+  }
+  return {
+    title,
+    description,
+    discount_percentage: discountPercentage,
+    minimum_nights: minimumNights,
+    display_order: displayOrder,
+    featured: input.featured,
+    terms: terms.map((term) => term.trim()),
+    starts_at: startsAt,
+    ends_at: endsAt,
+    is_active: input.is_active
+  };
+};
 const callTenantRpc = async (name, args) => {
   const { supabaseUrl } = configuration$2();
   const response = await fetch(`${supabaseUrl}/rest/v1/rpc/${name}`, {
@@ -333,6 +393,78 @@ const getPublicHotelBookingData = async (request, response) => {
     response.json({ tenant, settings: { title: settings[0].booking_title, subtitle: settings[0].booking_subtitle }, offers, rooms });
   } catch (error) {
     response.status(404).json({ error: error instanceof Error ? error.message : "Hotel information could not be loaded" });
+  }
+};
+const getPublicHotelOffers = async (request, response) => {
+  try {
+    const tenant = await resolveRequestHotelTenant(request);
+    const organizationId = encodeURIComponent(tenant.organizationId);
+    const now = (/* @__PURE__ */ new Date()).toISOString();
+    const [roomOffers, menuItems, loyaltyPrograms, events] = await Promise.all([
+      readService$2(`hotel_booking_offers?organization_id=eq.${organizationId}&is_active=eq.true&select=id,title,description,discount_percentage,minimum_nights,starts_at,ends_at,display_order,featured,terms&order=display_order`),
+      readService$2(`menu_items?organization_id=eq.${organizationId}&is_published=eq.true&special_offer=not.is.null&select=id,name,short_description,price,original_price,currency,special_offer,availability,max_availability&order=created_at.asc`),
+      readService$2(`hotel_loyalty_programs?organization_id=eq.${organizationId}&program_enabled=eq.true&select=program_name,points_per_1000_ugx&limit=1`),
+      readService$2(`special_events?organization_id=eq.${organizationId}&status=eq.published&is_private=eq.false&starts_at=gte.${encodeURIComponent(now)}&select=id,title,description,starts_at,ends_at,location,price,currency,category,image_url,featured&order=featured.desc,starts_at.asc`)
+    ]);
+    const dateIsCurrent = (startsAt, endsAt) => (typeof startsAt !== "string" || new Date(startsAt).getTime() <= Date.now()) && (typeof endsAt !== "string" || new Date(endsAt).getTime() > Date.now());
+    const offers = [
+      ...roomOffers.filter((offer) => dateIsCurrent(offer.starts_at, offer.ends_at) && Number(offer.discount_percentage) > 0).map((offer) => ({ ...offer, discount: `${Number(offer.discount_percentage)}% OFF`, category: "accommodation", source: "booking" })),
+      ...menuItems.filter((item) => typeof item.special_offer === "string" && item.special_offer.trim()).map((item) => ({ ...item, availability: item.availability === null ? null : Number(item.availability), title: item.name, description: `${item.special_offer}. ${item.short_description || ""}`.trim(), discount: item.original_price && Number(item.original_price) > Number(item.price) ? `${Math.round((1 - Number(item.price) / Number(item.original_price)) * 100)}% OFF` : "MENU SPECIAL", category: "dining", source: "menu" })),
+      ...loyaltyPrograms.map((program) => ({ ...program, id: "hotel-rewards", title: program.program_name, description: `Earn ${program.points_per_1000_ugx} point${Number(program.points_per_1000_ugx) === 1 ? "" : "s"} for every UGX 1,000 spent on eligible purchases.`, discount: "REWARDS", category: "loyalty", source: "loyalty" })),
+      ...events.filter((event) => typeof event.ends_at !== "string" || new Date(event.ends_at).getTime() > Date.now()).map((event) => ({ ...event, title: event.title, discount: event.price && Number(event.price) > 0 ? `FROM ${event.currency || ""} ${event.price}` : "UPCOMING EVENT", category: "seasonal", source: "event" }))
+    ];
+    setPrivateTenantResponse(response);
+    response.json({ tenant, offers });
+  } catch (error) {
+    response.status(404).json({ error: error instanceof Error ? error.message : "Offers could not be loaded" });
+  }
+};
+const checkHotelOfferManagementAccess = async (request, response) => {
+  try {
+    await requireHotelManager(request);
+    setPrivateTenantResponse(response);
+    response.json({ authorized: true });
+  } catch (error) {
+    const status = error.status ?? (error instanceof Error && error.message.includes("Authentication") ? 401 : 503);
+    response.status(status).json({ authorized: false });
+  }
+};
+const getHotelOffersForManagement = async (request, response) => {
+  try {
+    const tenant = await requireHotelManager(request);
+    const organizationId = encodeURIComponent(tenant.organizationId);
+    const offers = await readService$2(`hotel_booking_offers?organization_id=eq.${organizationId}&select=id,title,description,discount_percentage,minimum_nights,starts_at,ends_at,display_order,featured,terms,is_active&order=display_order`);
+    setPrivateTenantResponse(response);
+    response.json({ offers });
+  } catch (error) {
+    const status = error.status ?? (error instanceof Error && error.message.includes("Authentication") ? 401 : 503);
+    response.status(status).json({ error: error instanceof Error ? error.message : "Hotel offers could not be loaded" });
+  }
+};
+const saveHotelOffer = async (request, response) => {
+  try {
+    const tenant = await requireHotelManager(request);
+    const body = request.body;
+    const offerId = body.id;
+    if (offerId !== void 0 && (typeof offerId !== "string" || !isUuid$1(offerId))) {
+      response.status(400).json({ error: "Offer identifier is invalid" });
+      return;
+    }
+    const offer = validateHotelOffer(body);
+    const organizationId = encodeURIComponent(tenant.organizationId);
+    if (typeof offerId === "string") {
+      const updated = await writeService$1(`hotel_booking_offers?id=eq.${encodeURIComponent(offerId)}&organization_id=eq.${organizationId}&select=id`, "PATCH", offer);
+      if (!updated.length) {
+        throw hotelOfferError("Offer was not found for this hotel", 404);
+      }
+    } else {
+      await writeService$1("hotel_booking_offers?select=id", "POST", { ...offer, organization_id: tenant.organizationId });
+    }
+    setPrivateTenantResponse(response);
+    response.json({ ok: true });
+  } catch (error) {
+    const status = error.status ?? (error instanceof Error && error.message.includes("Authentication") ? 401 : 400);
+    response.status(status).json({ error: error instanceof Error ? error.message : "Hotel offer could not be saved" });
   }
 };
 const getPublicMenuItems = async (request, response) => {
@@ -1966,6 +2098,10 @@ function createServer() {
   app2.post("/api/hotel-rewards/enrollment", updateHotelRewardsEnrollment);
   app2.post("/api/hotel-complaints", submitHotelComplaint);
   app2.get("/api/hotel-booking-data", getPublicHotelBookingData);
+  app2.get("/api/hotel-offers", getPublicHotelOffers);
+  app2.get("/api/hotel-offers/manage/access", checkHotelOfferManagementAccess);
+  app2.get("/api/hotel-offers/manage", getHotelOffersForManagement);
+  app2.post("/api/hotel-offers/manage", saveHotelOffer);
   app2.get("/api/hotel-menu-items", getPublicMenuItems);
   app2.get("/api/hotel-menu-video/:attachmentId", getPublicMenuVideo);
   app2.post("/api/hotel-menu-availability", requestHotelMenuAvailability);
