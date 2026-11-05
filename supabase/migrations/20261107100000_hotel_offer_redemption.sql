@@ -133,7 +133,7 @@ begin
 
   replacement_source := regexp_replace(
     function_source,
-    '  select coalesce\(max\(discount_percentage\), 0\)[[:space:]]+into discount_rate[[:space:]]+from public\.hotel_booking_offers[[:space:]]+where[[:space:]]+(organization_id[[:space:]]*=[[:space:]]*selected_room\.organization_id[[:space:]]+and[[:space:]]+)?is_active[[:space:]]+and minimum_nights <= nights_count[[:space:]]+and \(starts_at is null or starts_at <= now\(\)\)[[:space:]]+and \(ends_at is null or ends_at > now\(\)\);[[:space:]]+discount_value := round\([[:space:]]+room_subtotal \* discount_rate / 100,[[:space:]]+currency_decimals[[:space:]]+\);[[:space:]]+taxable_value := room_subtotal - discount_value;',
+    '  select coalesce\(max\(discount_percentage\), 0\)[[:space:]]+into discount_rate[[:space:]]+from public\.hotel_booking_offers[[:space:]]+where[[:space:]]+((organization_id[[:space:]]*=[[:space:]]*selected_room\.organization_id|category[[:space:]]*=[[:space:]]*''accommodation'')[[:space:]]+and[[:space:]]+){0,2}is_active[[:space:]]+and minimum_nights <= nights_count[[:space:]]+and \(starts_at is null or starts_at <= now\(\)\)[[:space:]]+and \(ends_at is null or ends_at > now\(\)\);[[:space:]]+discount_value := round\([[:space:]]+room_subtotal \* discount_rate / 100,[[:space:]]+currency_decimals[[:space:]]+\);[[:space:]]+taxable_value := room_subtotal - discount_value;',
     $replacement$
   if nullif(trim(target_guest->>'promo_code'), '') is not null then
     select offer.* into selected_offer
