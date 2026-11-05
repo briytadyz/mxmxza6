@@ -246,6 +246,9 @@ const createBooking: RequestHandler = async (request, response) => {
       if (!supportedCurrencies.has(currency) || !ratesSnapshot.rates[currency]) throw new HotelBookingError("This room uses an unsupported booking currency");
     }
 
+    await callServiceRpc<number>("release_expired_hotel_offer_holds_for_tenant", {
+      target_organization_id: tenant.organizationId,
+    });
     const rows = await callServiceRpc<Array<{ booking_id: string; confirmation_number: string; total_amount: number; currency_code: string; expires_at: string }>>(
       "create_hotel_booking_for_tenant",
       {
@@ -256,6 +259,7 @@ const createBooking: RequestHandler = async (request, response) => {
           last_name: safeText(body.guest?.lastName, 100),
           email,
           phone: safeText(body.guest?.phone, 40),
+          promo_code: safeText(body.guest?.promoCode, 50).toUpperCase(),
           business_purchase: body.guest?.businessPurchase === true,
           buyer_tax_id: safeText(body.guest?.buyerTaxId, 30),
         },

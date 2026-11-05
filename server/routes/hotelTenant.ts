@@ -176,19 +176,36 @@ const validateHotelOffer = (value: unknown) => {
   const input = value && typeof value === "object" && !Array.isArray(value) ? value as Record<string, unknown> : {};
   const title = typeof input.title === "string" ? input.title.trim() : "";
   const description = typeof input.description === "string" ? input.description.trim() : "";
+  const discountType = input.discount_type;
   const discountPercentage = Number(input.discount_percentage);
+  const discountAmount = Number(input.discount_amount);
+  const currencyCode = typeof input.currency_code === "string" ? input.currency_code.trim().toUpperCase() : "";
+  const minimumSpend = Number(input.min_spend);
+  const maximumDiscount = Number(input.max_discount);
+  const maximumUses = input.max_uses === null || input.max_uses === "" ? null : Number(input.max_uses);
   const minimumNights = Number(input.minimum_nights);
   const displayOrder = Number(input.display_order);
+  const promoCode = typeof input.promo_code === "string" && input.promo_code.trim() ? input.promo_code.trim().toUpperCase() : null;
   const terms = input.terms;
   const startsAt = input.starts_at === null || input.starts_at === "" ? null : input.starts_at;
   const endsAt = input.ends_at === null || input.ends_at === "" ? null : input.ends_at;
   const startsAtTimestamp = typeof startsAt === "string" ? Date.parse(startsAt) : null;
   const endsAtTimestamp = typeof endsAt === "string" ? Date.parse(endsAt) : null;
   if (!title || title.length > 120 || !description || description.length > 2000
-    || !Number.isFinite(discountPercentage) || discountPercentage <= 0 || discountPercentage > 100
+    || (discountType !== "percentage" && discountType !== "fixed")
+    || !Number.isFinite(discountPercentage) || discountPercentage < 0 || discountPercentage > 100
+    || !Number.isFinite(discountAmount) || discountAmount < 0
+    || (discountType === "percentage" && discountPercentage <= 0)
+    || (discountType === "fixed" && (!promoCode || discountAmount <= 0))
+    || !["USD", "UGX", "EUR", "GBP", "KES", "TZS", "RWF"].includes(currencyCode)
+    || !Number.isFinite(minimumSpend) || minimumSpend < 0
+    || !Number.isFinite(maximumDiscount) || maximumDiscount < 0
+    || (maximumUses !== null && (!Number.isInteger(maximumUses) || maximumUses < 1 || !promoCode))
+    || (promoCode !== null && !/^[A-Z0-9_-]{2,50}$/.test(promoCode))
     || !Number.isInteger(minimumNights) || minimumNights < 1
     || !Number.isInteger(displayOrder) || displayOrder < 0
     || typeof input.featured !== "boolean" || typeof input.is_active !== "boolean"
+    || typeof input.limited_time !== "boolean"
     || !Array.isArray(terms) || terms.length > 12 || terms.some((term) => typeof term !== "string" || !term.trim() || term.length > 300)
     || (startsAt !== null && (typeof startsAt !== "string" || !Number.isFinite(startsAtTimestamp)))
     || (endsAt !== null && (typeof endsAt !== "string" || !Number.isFinite(endsAtTimestamp)))
@@ -198,8 +215,20 @@ const validateHotelOffer = (value: unknown) => {
   return {
     title,
     description,
+    category: "accommodation",
+    discount_type: discountType,
+    discount_label: typeof input.discount_label === "string" ? input.discount_label.trim().slice(0, 40) : "",
     discount_percentage: discountPercentage,
+    discount_amount: discountAmount,
+    currency_code: currencyCode,
     minimum_nights: minimumNights,
+    min_spend: minimumSpend,
+    max_discount: maximumDiscount,
+    max_uses: maximumUses,
+    promo_code: promoCode,
+    image: typeof input.image === "string" && input.image.trim() ? input.image.trim().slice(0, 8) : "🏨",
+    popularity: Number.isInteger(Number(input.popularity)) ? Math.max(0, Math.min(100, Number(input.popularity))) : 0,
+    limited_time: input.limited_time,
     display_order: displayOrder,
     featured: input.featured,
     terms: terms.map((term: string) => term.trim()),
@@ -478,9 +507,10 @@ export const getPublicHotelBookingData: RequestHandler = async (request, respons
   try {
     const tenant = await resolveRequestHotelTenant(request);
     const organizationId = encodeURIComponent(tenant.organizationId);
+    await callTenantRpc("release_expired_hotel_offer_holds_for_tenant", { target_organization_id: tenant.organizationId });
     const [settings, offers, rooms] = await Promise.all([
       readService<Array<{ booking_title: string; booking_subtitle: string }>>(`hotel_tenant_settings?organization_id=eq.${organizationId}&select=booking_title,booking_subtitle&is_active=eq.true&limit=1`),
-      readService(`hotel_booking_offers?organization_id=eq.${organizationId}&is_active=eq.true&select=id,title,description,discount_percentage,minimum_nights,starts_at,ends_at&order=display_order`),
+      readService(`hotel_booking_offers?organization_id=eq.${organizationId}&category=eq.accommodation&is_active=eq.true&select=id,title,description,discount_percentage,discount_type,discount_label,discount_amount,currency_code,min_spend,max_discount,promo_code,image,popularity,limited_time,minimum_nights,starts_at,ends_at,max_uses,usage_count&order=display_order`),
       readService(`hotel_public_room_listings?organization_id=eq.${organizationId}&select=id,organization_id,name,room_type,description,image_url,size_sqm,max_guests,available_units,nightly_rate,original_nightly_rate,currency_code,amenities,status,hotel_name,hotel_city,hotel_country,hotel_classification&order=nightly_rate`),
     ]);
     if (settings.length !== 1) throw new Error("Hotel booking content is not configured");
@@ -496,8 +526,9 @@ export const getPublicHotelOffers: RequestHandler = async (request, response) =>
     const tenant = await resolveRequestHotelTenant(request);
     const organizationId = encodeURIComponent(tenant.organizationId);
     const now = new Date().toISOString();
+    await callTenantRpc("release_expired_hotel_offer_holds_for_tenant", { target_organization_id: tenant.organizationId });
     const [roomOffers, menuItems, loyaltyPrograms, events] = await Promise.all([
-      readService<Array<Record<string, unknown>>>(`hotel_booking_offers?organization_id=eq.${organizationId}&is_active=eq.true&select=id,title,description,discount_percentage,minimum_nights,starts_at,ends_at,display_order,featured,terms&order=display_order`),
+      readService<Array<Record<string, unknown>>>(`hotel_booking_offers?organization_id=eq.${organizationId}&category=eq.accommodation&is_active=eq.true&select=id,title,description,discount_percentage,discount_type,discount_label,discount_amount,currency_code,min_spend,max_discount,promo_code,image,popularity,limited_time,minimum_nights,starts_at,ends_at,display_order,featured,terms,max_uses,usage_count&order=display_order`),
       readService<Array<Record<string, unknown>>>(`menu_items?organization_id=eq.${organizationId}&is_published=eq.true&special_offer=not.is.null&select=id,name,short_description,price,original_price,currency,special_offer,availability,max_availability&order=created_at.asc`),
       readService<Array<{ program_name: string; points_per_1000_ugx: number }>>(`hotel_loyalty_programs?organization_id=eq.${organizationId}&program_enabled=eq.true&select=program_name,points_per_1000_ugx&limit=1`),
       readService<Array<Record<string, unknown>>>(`special_events?organization_id=eq.${organizationId}&status=eq.published&is_private=eq.false&starts_at=gte.${encodeURIComponent(now)}&select=id,title,description,starts_at,ends_at,location,price,currency,category,image_url,featured&order=featured.desc,starts_at.asc`),
@@ -506,7 +537,7 @@ export const getPublicHotelOffers: RequestHandler = async (request, response) =>
       (typeof startsAt !== "string" || new Date(startsAt).getTime() <= Date.now())
       && (typeof endsAt !== "string" || new Date(endsAt).getTime() > Date.now());
     const offers = [
-      ...roomOffers.filter((offer) => dateIsCurrent(offer.starts_at, offer.ends_at) && Number(offer.discount_percentage) > 0).map((offer) => ({ ...offer, discount: `${Number(offer.discount_percentage)}% OFF`, category: "accommodation", source: "booking" })),
+      ...roomOffers.filter((offer) => dateIsCurrent(offer.starts_at, offer.ends_at) && (offer.discount_type === "fixed" ? Boolean(offer.promo_code) && Number(offer.discount_amount) > 0 : Number(offer.discount_percentage) > 0)).map((offer) => ({ ...offer, discount: typeof offer.discount_label === "string" && offer.discount_label.trim() ? offer.discount_label : offer.discount_type === "fixed" ? `${offer.currency_code || ""} ${offer.discount_amount} OFF` : `${Number(offer.discount_percentage)}% OFF`, category: "accommodation", source: "booking" })),
       ...menuItems.filter((item) => typeof item.special_offer === "string" && item.special_offer.trim()).map((item) => ({ ...item, availability: item.availability === null ? null : Number(item.availability), title: item.name, description: `${item.special_offer}. ${item.short_description || ""}`.trim(), discount: item.original_price && Number(item.original_price) > Number(item.price) ? `${Math.round((1 - Number(item.price) / Number(item.original_price)) * 100)}% OFF` : "MENU SPECIAL", category: "dining", source: "menu" })),
       ...loyaltyPrograms.map((program) => ({ ...program, id: "hotel-rewards", title: program.program_name, description: `Earn ${program.points_per_1000_ugx} point${Number(program.points_per_1000_ugx) === 1 ? "" : "s"} for every UGX 1,000 spent on eligible purchases.`, discount: "REWARDS", category: "loyalty", source: "loyalty" })),
       ...events.filter((event) => typeof event.ends_at !== "string" || new Date(event.ends_at).getTime() > Date.now()).map((event) => ({ ...event, title: event.title, discount: event.price && Number(event.price) > 0 ? `FROM ${event.currency || ""} ${event.price}` : "UPCOMING EVENT", category: "seasonal", source: "event" })),
@@ -534,7 +565,8 @@ export const getHotelOffersForManagement: RequestHandler = async (request, respo
   try {
     const tenant = await requireHotelManager(request);
     const organizationId = encodeURIComponent(tenant.organizationId);
-    const offers = await readService<Array<Record<string, unknown>>>(`hotel_booking_offers?organization_id=eq.${organizationId}&select=id,title,description,discount_percentage,minimum_nights,starts_at,ends_at,display_order,featured,terms,is_active&order=display_order`);
+    await callTenantRpc("release_expired_hotel_offer_holds_for_tenant", { target_organization_id: tenant.organizationId });
+    const offers = await readService<Array<Record<string, unknown>>>(`hotel_booking_offers?organization_id=eq.${organizationId}&category=eq.accommodation&select=id,title,description,discount_percentage,discount_type,discount_label,discount_amount,currency_code,min_spend,max_discount,promo_code,image,popularity,limited_time,minimum_nights,starts_at,ends_at,display_order,featured,terms,max_uses,usage_count,is_active&order=display_order`);
     setPrivateTenantResponse(response);
     response.json({ offers });
   } catch (error) {

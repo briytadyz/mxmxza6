@@ -68,6 +68,7 @@ describe("getPublicHotelOffers", () => {
         primary_color: null,
         accent_color: null,
       }]), { status: 200 });
+      if (url.endsWith("/rpc/release_expired_hotel_offer_holds_for_tenant")) return new Response("0", { status: 200 });
       if (url.includes("hotel_booking_offers?")) return new Response(JSON.stringify([{
         id: "stay-offer",
         title: "Extended Stay",

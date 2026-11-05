@@ -40,8 +40,10 @@ describe("createHotelBooking", () => {
           fx_rates_snapshot: { as_of: "2026-09-30T00:00:00.000Z" },
         }]);
       }
+      if (url.endsWith("/rpc/release_expired_hotel_offer_holds_for_tenant")) return jsonResponse(0);
       if (url.endsWith("/rpc/create_hotel_booking_for_tenant")) {
         expect(JSON.parse(String(init?.body)).target_organization_id).toBe(organizationId);
+        expect(JSON.parse(String(init?.body)).target_guest.promo_code).toBe("WELCOME20");
         expect(JSON.parse(String(init?.body)).target_fx_rates).toBeNull();
         return jsonResponse([{
           booking_id: "d536669f-7c9c-4885-a438-71ba7723f5e9",
@@ -79,7 +81,7 @@ describe("createHotelBooking", () => {
       hostname: "sheraspace.example.test",
       body: {
         roomId: "e1600390-b355-4ca4-ae0a-5e18dd449f6f",
-        guest: { firstName: "Test", lastName: "Guest", email: "guest@example.com", phone: "+256700000000" },
+        guest: { firstName: "Test", lastName: "Guest", email: "guest@example.com", phone: "+256700000000", promoCode: "welcome20" },
         checkIn: "2020-10-01",
         checkOut: "2020-10-03",
         guestCount: 1,
@@ -93,7 +95,7 @@ describe("createHotelBooking", () => {
 
     expect(result.statusCode).toBe(200);
     expect(result.body).toMatchObject({ booking_id: "d536669f-7c9c-4885-a438-71ba7723f5e9", fxAsOf: "2026-09-30T00:00:00.000Z" });
-    expect(fetchMock).toHaveBeenCalledTimes(4);
+    expect(fetchMock).toHaveBeenCalledTimes(5);
     expect(fetchMock.mock.calls.some(([input]) => String(input).includes("open.er-api.com"))).toBe(false);
   });
 });
