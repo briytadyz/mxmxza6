@@ -8,7 +8,7 @@ import QRCode from "qrcode";
 import { createClient } from "@supabase/supabase-js";
 
 type BankRecord = Record<string, string>;
-type InvoicePayload = { record?: { id?: string; status?: string; organization_id?: string }; old_record?: { status?: string }; correlationId?: string; correlation_id?: string };
+type InvoicePayload = { eventType?: string; record?: { id?: string; status?: string; organization_id?: string; invoice_number?: string }; old_record?: { status?: string }; correlationId?: string; correlation_id?: string };
 type ImportPayload = { importId?: string; organizationId?: string; storageKey?: string; fileUrl?: string; correlationId?: string; correlation_id?: string };
 type Stage = "validation" | "supabase_reads" | "pdf" | "b2" | "receipt_update" | "brevo";
 type ErrorEnvelope = { ok: false; stage: Stage; retryable: boolean; correlationId: string; error: string };
@@ -181,11 +181,11 @@ function isValidEmail(value: string | null | undefined): value is string {
   return Boolean(value && /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(value.trim()));
 }
 
-async function createInvoicePdf(invoiceId: string): Promise<InvoiceDocument> {
+async function createInvoicePdf(invoiceId: string, documentKind: "invoice" | "receipt"): Promise<InvoiceDocument> {
   const client = supabase();
-  const { data: invoice, error: invoiceError } = await client.from("books_invoices").select("id,invoice_number,issue_date,due_date,currency_code,subtotal,tax_amount,other_charges,total_due,organization_id,contact_id,receipt_storage_key,notes,buyer_tax_id").eq("id", invoiceId).single();
+  const { data: invoice, error: invoiceError } = await client.from("books_invoices").select("id,invoice_number,issue_date,due_date,currency_code,subtotal,tax_amount,other_charges,total_due,organization_id,contact_id,invoice_storage_key,receipt_storage_key,notes,buyer_tax_id").eq("id", invoiceId).single();
   if (invoiceError || !invoice) throw invoiceError || new Error("Invoice not found");
-  if (!invoice.contact_id) throw new Error("Paid invoice has no customer contact");
+  if (!invoice.contact_id) throw new Error("Invoice has no customer contact");
   const { data: loyaltyData, error: loyaltyError } = await client.rpc("get_paid_invoice_loyalty_receipt", { target_invoice_id: invoice.id });
   if (loyaltyError) throw loyaltyError;
   const loyaltySummary = loyaltyData as InvoiceDocument["loyaltySummary"];
@@ -198,6 +198,7 @@ async function createInvoicePdf(invoiceId: string): Promise<InvoiceDocument> {
   if (contactError) throw contactError;
   if (linesError) throw linesError;
   const isHotelInvoice = invoice.invoice_number.startsWith("HOTEL-");
+  const isWorkerTaskInvoice = invoice.invoice_number.startsWith("TASK-");
   const isVatInclusiveSale = /^(MENU|EVENT)-/.test(invoice.invoice_number);
   const isMenuInvoice = invoice.invoice_number.startsWith("MENU-");
   const menuCharges = isMenuInvoice
@@ -236,11 +237,12 @@ async function createInvoicePdf(invoiceId: string): Promise<InvoiceDocument> {
   });
   document.fontSize(22).text(organization?.name || "Business", { align: "right" });
   document.moveDown();
-  document.fontSize(16).text(`Invoice ${invoice.invoice_number}`);
+  document.fontSize(16).text(`${documentKind === "receipt" ? "Receipt for invoice" : "Invoice"} ${invoice.invoice_number}`);
   document.fontSize(10).text(`Issued: ${invoice.issue_date}`).text(`Due: ${invoice.due_date}`);
+  if (documentKind === "receipt") document.fontSize(11).fillColor("#167a42").text("PAID").fillColor("#000000");
   document.moveDown();
   document.fontSize(12).text(`Bill to: ${contact.name}`);
-  if (contact.email) document.fontSize(10).text(contact.email);
+  if (contact.email && !isWorkerTaskInvoice) document.fontSize(10).text(contact.email);
   if (contact.tax_id) document.fontSize(10).text(`Tax ID: ${contact.tax_id}`);
   if (invoice.buyer_tax_id) document.fontSize(10).text(`Buyer TIN / BRN / NIN: ${invoice.buyer_tax_id}`);
   if (invoice.notes) document.fontSize(10).text(invoice.notes.replace(/\s*\([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\)/i, ""));
@@ -280,18 +282,23 @@ async function createInvoicePdf(invoiceId: string): Promise<InvoiceDocument> {
     document.fontSize(10).text(loyaltyText);
   }
   document.end();
-  return { buffer: await completed, fileName: invoice.receipt_storage_key || `books/invoices/${invoice.organization_id}/${invoice.invoice_number}.pdf`, recipient: isValidEmail(contact?.email) ? contact.email.trim() : null, subject: `Your Invoice Receipt - ${invoice.invoice_number}`, invoiceNumber: invoice.invoice_number, organizationId: invoice.organization_id, loyaltySummary };
+  const recipient = !isWorkerTaskInvoice && isValidEmail(contact?.email) ? contact.email.trim() : null;
+  const fileName = documentKind === "receipt"
+    ? invoice.receipt_storage_key || `books/receipts/${invoice.organization_id}/${invoice.invoice_number}.pdf`
+    : invoice.invoice_storage_key || `books/invoices/${invoice.organization_id}/${invoice.invoice_number}.pdf`;
+  return { buffer: await completed, fileName, recipient, subject: documentKind === "receipt" ? `Payment receipt - ${invoice.invoice_number}` : `Invoice ${invoice.invoice_number}`, invoiceNumber: invoice.invoice_number, organizationId: invoice.organization_id, loyaltySummary };
 }
 
-async function sendBrevoEmail(recipient: string, subject: string, pdf: Buffer, fileName: string, loyaltySummary: InvoiceDocument["loyaltySummary"]): Promise<void> {
+async function sendBrevoEmail(recipients: string[], subject: string, pdf: Buffer, fileName: string, loyaltySummary: InvoiceDocument["loyaltySummary"], documentKind: "invoice" | "receipt"): Promise<void> {
   const response = await fetch("https://api.brevo.com/v3/smtp/email", {
     method: "POST",
     headers: { "api-key": required("BREVO_API_KEY"), "content-type": "application/json" },
     body: JSON.stringify({
       sender: { email: process.env.BREVO_SENDER_EMAIL || "billing-test@yourplatform.com", name: process.env.BREVO_SENDER_NAME || "Books" },
-      to: [{ email: recipient }],
+      to: [{ email: recipients[0] }],
+      bcc: recipients.slice(1).map((email) => ({ email })),
       subject,
-      htmlContent: `<p>Thank you. Your paid invoice is attached.</p>${loyaltySummary ? `<p>Loyalty points earned on this purchase: ${loyaltySummary.pointsEarned}. Current balance: ${loyaltySummary.currentBalance}.</p>` : ""}`,
+      htmlContent: `<p>${documentKind === "receipt" ? "Your payment is confirmed. The receipt is attached." : "Your invoice is attached."}</p>${loyaltySummary ? `<p>Loyalty points earned on this purchase: ${loyaltySummary.pointsEarned}. Current balance: ${loyaltySummary.currentBalance}.</p>` : ""}`,
       attachment: [{ name: fileName.split("/").pop(), content: pdf.toString("base64") }],
     }),
   });
@@ -308,17 +315,6 @@ async function updateDeliveryAudit(client: ReturnType<typeof supabase>, correlat
   } catch {
     logStage("supabase_reads", correlationIdValue, { operation: "delivery_audit_update", updateFailed: true });
   }
-}
-
-async function updateInvoice(client: ReturnType<typeof supabase>, invoiceId: string, values: Record<string, unknown>): Promise<void> {
-  const { error } = await client.from("books_invoices").update(values).eq("id", invoiceId).eq("status", "paid");
-  if (!error) return;
-  if (Object.keys(values).some((key) => key.startsWith("receipt_delivery_"))) {
-    const legacyValues = Object.fromEntries(Object.entries(values).filter(([key]) => !key.startsWith("receipt_delivery_")));
-    const { error: legacyError } = await client.from("books_invoices").update(legacyValues).eq("id", invoiceId).eq("status", "paid");
-    if (!legacyError) return;
-  }
-  throw error;
 }
 
 const runtimeSecrets = ["SUPABASE_SERVICE_ROLE_KEY", "SUPABASE_WEBHOOK_SECRET", "B2_KEY_ID", "B2_APPLICATION_KEY", "BREVO_API_KEY"];
@@ -462,27 +458,39 @@ export const generateAndSendInvoicePDF = onRequest({ region: "us-central1", time
     response.status(405).json({ ok: false, stage: "validation", retryable: false, correlationId: correlation, error: "POST required" });
     return;
   }
+  const documentKind = payload.eventType === "invoice.issued" ? "invoice" : "receipt";
   let activeStage: Stage = "validation";
   try {
-    logStage("validation", correlation, { operation: "invoice_delivery" });
+    logStage("validation", correlation, { operation: "invoice_delivery", documentKind });
     verifyWebhook(request, raw);
     const invoiceId = payload.record?.id;
-    if (!invoiceId || payload.record?.status !== "paid" || payload.old_record?.status === "paid") {
+    const expectedStatus = documentKind === "invoice" ? "sent" : "paid";
+    if (!invoiceId || payload.record?.status !== expectedStatus || (documentKind === "receipt" && payload.old_record?.status === "paid")) {
       response.json({ ok: true, skipped: true, correlationId: correlation });
       return;
     }
     activeStage = "supabase_reads";
     logStage("supabase_reads", correlation, { operation: "invoice_delivery", invoiceId });
-    activeStage = "pdf";
-    const document = await createInvoicePdf(invoiceId);
-    logStage("pdf", correlation, { invoiceId, organizationId: document.organizationId });
     const client = supabase();
-    activeStage = "supabase_reads";
-    const { data: current, error: currentError } = await client.from("books_invoices").select("receipt_storage_key").eq("id", invoiceId).eq("status", "paid").single();
+    const { data: current, error: currentError } = await client.from("books_invoices")
+      .select("invoice_storage_key,receipt_storage_key,invoice_delivery_status,receipt_delivery_status,status")
+      .eq("id", invoiceId).single();
     if (currentError || !current) throw failure("supabase_reads", correlation, currentError || new Error("Invoice not found"));
-    const { data: deliveryState } = await client.from("books_invoices").select("receipt_delivery_status").eq("id", invoiceId).eq("status", "paid").maybeSingle();
-    const storageKey = current.receipt_storage_key || document.fileName;
-    if (!current.receipt_storage_key) {
+    if (documentKind === "receipt" ? current.status !== "paid" : !["sent", "overdue", "paid"].includes(current.status)) {
+      response.json({ ok: true, skipped: true, correlationId: correlation });
+      return;
+    }
+    const deliveryStatus = documentKind === "invoice" ? current.invoice_delivery_status : current.receipt_delivery_status;
+    if (deliveryStatus === "sent") {
+      response.json({ ok: true, invoiceId, skippedEmail: true, correlationId: correlation });
+      return;
+    }
+    activeStage = "pdf";
+    const document = await createInvoicePdf(invoiceId, documentKind);
+    logStage("pdf", correlation, { invoiceId, organizationId: document.organizationId });
+    const existingStorageKey = documentKind === "invoice" ? current.invoice_storage_key : current.receipt_storage_key;
+    const storageKey = existingStorageKey || document.fileName;
+    if (!existingStorageKey) {
       activeStage = "b2";
       logStage("b2", correlation, { invoiceId, organizationId: document.organizationId, action: "put" });
       await b2().send(new PutObjectCommand({ Bucket: bucket(), Key: storageKey, Body: document.buffer, ContentType: "application/pdf" }));
@@ -490,35 +498,63 @@ export const generateAndSendInvoicePDF = onRequest({ region: "us-central1", time
       logStage("b2", correlation, { invoiceId, organizationId: document.organizationId, action: "reuse" });
     }
     const publicUrl = process.env.B2_PUBLIC_URL ? `${process.env.B2_PUBLIC_URL.replace(/\/$/, "")}/${storageKey}` : null;
-    if (deliveryState?.receipt_delivery_status === "sent") {
-      response.json({ ok: true, invoiceId, storageKey, skippedEmail: true, correlationId: correlation });
-      return;
+    const recipients = new Map<string, string>();
+    const { data: taskInvoice, error: taskInvoiceError } = await client.from("worker_task_invoices").select("task_id").eq("invoice_id", invoiceId).maybeSingle();
+    if (taskInvoiceError) throw taskInvoiceError;
+    if (taskInvoice) {
+      const { data: task, error: taskError } = await client.from("tasks").select("created_by,assigned_to").eq("id", taskInvoice.task_id).single();
+      if (taskError || !task) throw taskError || new Error("Task not found");
+      const [{ data: managerProfile, error: managerError }, { data: workerProfile, error: workerError }] = await Promise.all([
+        client.from("user_profiles").select("email").eq("user_id", task.created_by).maybeSingle(),
+        client.from("user_profiles").select("email").eq("id", task.assigned_to).maybeSingle(),
+      ]);
+      if (managerError) throw managerError;
+      if (workerError) throw workerError;
+      if (isValidEmail(managerProfile?.email)) recipients.set(managerProfile.email.trim().toLowerCase(), managerProfile.email.trim());
+      if (isValidEmail(workerProfile?.email)) recipients.set(workerProfile.email.trim().toLowerCase(), workerProfile.email.trim());
+    } else if (document.recipient) {
+      recipients.set(document.recipient.toLowerCase(), document.recipient);
     }
     activeStage = "receipt_update";
-    logStage("receipt_update", correlation, { invoiceId, organizationId: document.organizationId });
-    await updateInvoice(client, invoiceId, { receipt_url: publicUrl, receipt_storage_key: storageKey, receipt_delivery_status: "queued", receipt_delivery_error: null, receipt_delivery_attempted_at: new Date().toISOString() });
-    if (!document.recipient) {
-      const deliveryMessage = "Receipt PDF stored; customer email is missing or invalid";
-      await updateInvoice(client, invoiceId, { receipt_delivery_status: "skipped", receipt_delivery_error: deliveryMessage, receipt_delivery_attempted_at: new Date().toISOString() });
-      await updateDeliveryAudit(client, correlation, { status: "skipped", sanitized_error: deliveryMessage, sent_at: new Date().toISOString(), updated_at: new Date().toISOString() });
+    logStage("receipt_update", correlation, { invoiceId, organizationId: document.organizationId, documentKind });
+    const timestamp = new Date().toISOString();
+    const deliveryColumns = documentKind === "invoice"
+      ? { invoice_url: publicUrl, invoice_storage_key: storageKey, invoice_delivery_status: recipients.size ? "queued" : "skipped", invoice_delivery_error: recipients.size ? null : "Invoice PDF stored; registered email address is missing or invalid", invoice_delivery_attempted_at: timestamp }
+      : { receipt_url: publicUrl, receipt_storage_key: storageKey, receipt_delivery_status: recipients.size ? "queued" : "skipped", receipt_delivery_error: recipients.size ? null : "Receipt PDF stored; registered email address is missing or invalid", receipt_delivery_attempted_at: timestamp };
+    const { error: invoiceUpdateError } = await client.from("books_invoices").update(deliveryColumns).eq("id", invoiceId);
+    if (invoiceUpdateError) throw invoiceUpdateError;
+    if (documentKind === "receipt" && taskInvoice && publicUrl) {
+      const { data: payment, error: paymentError } = await client.from("worker_task_payments").select("hotel_expense_id").eq("task_id", taskInvoice.task_id).maybeSingle();
+      if (paymentError) throw paymentError;
+      if (payment?.hotel_expense_id) {
+        const { error: expenseError } = await client.from("books_expenses").update({ receipt_url: publicUrl }).eq("id", payment.hotel_expense_id);
+        if (expenseError) throw expenseError;
+      }
+    }
+    if (!recipients.size) {
+      await updateDeliveryAudit(client, correlation, { status: "skipped", sanitized_error: "Registered email address is missing or invalid", sent_at: timestamp, updated_at: timestamp });
       response.json({ ok: true, invoiceId, storageKey, skippedEmail: true, correlationId: correlation });
       return;
     }
     activeStage = "brevo";
-    logStage("brevo", correlation, { invoiceId, organizationId: document.organizationId });
-    await sendBrevoEmail(document.recipient, document.subject, document.buffer, storageKey, document.loyaltySummary);
-    await updateInvoice(client, invoiceId, { receipt_delivery_status: "sent", receipt_delivery_error: null, receipt_delivery_attempted_at: new Date().toISOString() });
+    logStage("brevo", correlation, { invoiceId, organizationId: document.organizationId, recipientCount: recipients.size });
+    await sendBrevoEmail([...recipients.values()], document.subject, document.buffer, storageKey, document.loyaltySummary, documentKind);
+    const sentColumns = documentKind === "invoice"
+      ? { invoice_delivery_status: "sent", invoice_delivery_error: null, invoice_delivery_attempted_at: new Date().toISOString() }
+      : { receipt_delivery_status: "sent", receipt_delivery_error: null, receipt_delivery_attempted_at: new Date().toISOString() };
+    const { error: sentUpdateError } = await client.from("books_invoices").update(sentColumns).eq("id", invoiceId);
+    if (sentUpdateError) throw sentUpdateError;
     await updateDeliveryAudit(client, correlation, { status: "sent", sent_at: new Date().toISOString(), updated_at: new Date().toISOString() });
     response.json({ ok: true, invoiceId, storageKey, correlationId: correlation });
   } catch (error) {
     const failureError = (error as { envelope?: ErrorEnvelope }).envelope ? error as { envelope: ErrorEnvelope } : failure(activeStage, correlation, error);
     const client = supabase();
     if (payload.record?.id) {
-      try {
-        await updateInvoice(client, payload.record.id, { receipt_delivery_status: "failed", receipt_delivery_error: safeError(error), receipt_delivery_attempted_at: new Date().toISOString() });
-      } catch {
-        logStage("receipt_update", correlation, { operation: "invoice_failed_update", invoiceId: payload.record.id, updateFailed: true });
-      }
+      const errorColumns = documentKind === "invoice"
+        ? { invoice_delivery_status: "failed", invoice_delivery_error: safeError(error), invoice_delivery_attempted_at: new Date().toISOString() }
+        : { receipt_delivery_status: "failed", receipt_delivery_error: safeError(error), receipt_delivery_attempted_at: new Date().toISOString() };
+      const { error: updateError } = await client.from("books_invoices").update(errorColumns).eq("id", payload.record.id);
+      if (updateError) logStage("receipt_update", correlation, { operation: "invoice_failed_update", invoiceId: payload.record.id, updateFailed: true });
     }
     await updateDeliveryAudit(client, correlation, { status: "failed", sanitized_error: safeError(error), updated_at: new Date().toISOString() });
     response.status(failureError.envelope.retryable ? 500 : 400).json(failureError.envelope);

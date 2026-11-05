@@ -36,6 +36,8 @@ import BooksPage from "./pages/BooksPage";
 import ReviewsPage from "./pages/ReviewsPage";
 import ConciergePage from "./pages/ConciergePage";
 import OffersPage from "./pages/OffersPage";
+import HotelOffersPage from "./pages/HotelOffersPage";
+import HotelOffersManagementPage from "./pages/HotelOffersManagementPage";
 import WorkersPage from "./pages/WorkersPage";
 import { isWorkerRole } from "./lib/roles";
 import BillingPlansPage from "./pages/BillingPlansPage";
@@ -168,7 +170,9 @@ function App() {
               <Route path="/billing/payout-methods" element={<PayoutMethodPage />} />
               <Route path="/reviews" element={<ReviewsPage />} />
               <Route path="/concierge" element={<ConciergePage />} />
-              <Route path="/offers" element={<OffersPage />} />
+              <Route path="/offers" element={<HotelOffersPage />} />
+              <Route path="/offers/manage" element={<HotelOffersManagementPage />} />
+              <Route path="/offers-dev" element={<OffersPage />} />
               <Route
                 path="/spa"
                 element={<PlaceholderPage section="Spa & Wellness" />}

@@ -76,6 +76,85 @@ const updateService = async (path2, body) => {
   });
   if (!response.ok) throw new Error("Menu media information could not be saved");
 };
+const hotelOfferError = (message, status) => Object.assign(new Error(message), { status });
+const writeService$1 = async (path2, method, body) => {
+  const { supabaseUrl } = configuration$2();
+  const response = await fetch(`${supabaseUrl}/rest/v1/${path2}`, {
+    method,
+    headers: { ...serviceHeaders$2(true), Prefer: "return=representation" },
+    body: JSON.stringify(body),
+    signal: AbortSignal.timeout(1e4)
+  });
+  if (!response.ok) throw hotelOfferError("Hotel offer could not be saved", 503);
+  return response.json();
+};
+const requireHotelManager = async (request) => {
+  const tenant = await resolveRequestHotelTenant(request);
+  const userId = await getAuthenticatedUserId$2(request.headers.authorization);
+  const organizationId = encodeURIComponent(tenant.organizationId);
+  const userFilter = encodeURIComponent(userId);
+  let profiles;
+  let memberships;
+  try {
+    [profiles, memberships] = await Promise.all([
+      readService$2(`user_profiles?user_id=eq.${userFilter}&select=role&limit=1`),
+      readService$2(`books_memberships?organization_id=eq.${organizationId}&user_id=eq.${userFilter}&role=in.(owner,admin)&select=role&limit=1`)
+    ]);
+  } catch {
+    throw hotelOfferError("Hotel manager access could not be verified", 503);
+  }
+  if (profiles[0]?.role !== "manager" || !memberships[0]) {
+    throw hotelOfferError("Only a hotel manager can manage offers", 403);
+  }
+  return tenant;
+};
+const validateHotelOffer = (value) => {
+  const input = value && typeof value === "object" && !Array.isArray(value) ? value : {};
+  const title = typeof input.title === "string" ? input.title.trim() : "";
+  const description = typeof input.description === "string" ? input.description.trim() : "";
+  const discountType = input.discount_type;
+  const discountPercentage = Number(input.discount_percentage);
+  const discountAmount = Number(input.discount_amount);
+  const currencyCode = typeof input.currency_code === "string" ? input.currency_code.trim().toUpperCase() : "";
+  const minimumSpend = Number(input.min_spend);
+  const maximumDiscount = Number(input.max_discount);
+  const maximumUses = input.max_uses === null || input.max_uses === "" ? null : Number(input.max_uses);
+  const minimumNights = Number(input.minimum_nights);
+  const displayOrder = Number(input.display_order);
+  const promoCode = typeof input.promo_code === "string" && input.promo_code.trim() ? input.promo_code.trim().toUpperCase() : null;
+  const terms = input.terms;
+  const startsAt = input.starts_at === null || input.starts_at === "" ? null : input.starts_at;
+  const endsAt = input.ends_at === null || input.ends_at === "" ? null : input.ends_at;
+  const startsAtTimestamp = typeof startsAt === "string" ? Date.parse(startsAt) : null;
+  const endsAtTimestamp = typeof endsAt === "string" ? Date.parse(endsAt) : null;
+  if (!title || title.length > 120 || !description || description.length > 2e3 || discountType !== "percentage" && discountType !== "fixed" || !Number.isFinite(discountPercentage) || discountPercentage < 0 || discountPercentage > 100 || !Number.isFinite(discountAmount) || discountAmount < 0 || discountType === "percentage" && discountPercentage <= 0 || discountType === "fixed" && (!promoCode || discountAmount <= 0) || !["USD", "UGX", "EUR", "GBP", "KES", "TZS", "RWF"].includes(currencyCode) || !Number.isFinite(minimumSpend) || minimumSpend < 0 || !Number.isFinite(maximumDiscount) || maximumDiscount < 0 || maximumUses !== null && (!Number.isInteger(maximumUses) || maximumUses < 1 || !promoCode) || promoCode !== null && !/^[A-Z0-9_-]{2,50}$/.test(promoCode) || !Number.isInteger(minimumNights) || minimumNights < 1 || !Number.isInteger(displayOrder) || displayOrder < 0 || typeof input.featured !== "boolean" || typeof input.is_active !== "boolean" || typeof input.limited_time !== "boolean" || !Array.isArray(terms) || terms.length > 12 || terms.some((term) => typeof term !== "string" || !term.trim() || term.length > 300) || startsAt !== null && (typeof startsAt !== "string" || !Number.isFinite(startsAtTimestamp)) || endsAt !== null && (typeof endsAt !== "string" || !Number.isFinite(endsAtTimestamp)) || startsAtTimestamp !== null && endsAtTimestamp !== null && endsAtTimestamp <= startsAtTimestamp) {
+    throw new Error("Enter valid offer details and dates");
+  }
+  return {
+    title,
+    description,
+    category: "accommodation",
+    discount_type: discountType,
+    discount_label: typeof input.discount_label === "string" ? input.discount_label.trim().slice(0, 40) : "",
+    discount_percentage: discountPercentage,
+    discount_amount: discountAmount,
+    currency_code: currencyCode,
+    minimum_nights: minimumNights,
+    min_spend: minimumSpend,
+    max_discount: maximumDiscount,
+    max_uses: maximumUses,
+    promo_code: promoCode,
+    image: typeof input.image === "string" && input.image.trim() ? input.image.trim().slice(0, 8) : "🏨",
+    popularity: Number.isInteger(Number(input.popularity)) ? Math.max(0, Math.min(100, Number(input.popularity))) : 0,
+    limited_time: input.limited_time,
+    display_order: displayOrder,
+    featured: input.featured,
+    terms: terms.map((term) => term.trim()),
+    starts_at: startsAt,
+    ends_at: endsAt,
+    is_active: input.is_active
+  };
+};
 const callTenantRpc = async (name, args) => {
   const { supabaseUrl } = configuration$2();
   const response = await fetch(`${supabaseUrl}/rest/v1/rpc/${name}`, {
@@ -323,9 +402,10 @@ const getPublicHotelBookingData = async (request, response) => {
   try {
     const tenant = await resolveRequestHotelTenant(request);
     const organizationId = encodeURIComponent(tenant.organizationId);
+    await callTenantRpc("release_expired_hotel_offer_holds_for_tenant", { target_organization_id: tenant.organizationId });
     const [settings, offers, rooms] = await Promise.all([
       readService$2(`hotel_tenant_settings?organization_id=eq.${organizationId}&select=booking_title,booking_subtitle&is_active=eq.true&limit=1`),
-      readService$2(`hotel_booking_offers?organization_id=eq.${organizationId}&is_active=eq.true&select=id,title,description,discount_percentage,minimum_nights,starts_at,ends_at&order=display_order`),
+      readService$2(`hotel_booking_offers?organization_id=eq.${organizationId}&category=eq.accommodation&is_active=eq.true&select=id,title,description,discount_percentage,discount_type,discount_label,discount_amount,currency_code,min_spend,max_discount,promo_code,image,popularity,limited_time,minimum_nights,starts_at,ends_at,max_uses,usage_count&order=display_order`),
       readService$2(`hotel_public_room_listings?organization_id=eq.${organizationId}&select=id,organization_id,name,room_type,description,image_url,size_sqm,max_guests,available_units,nightly_rate,original_nightly_rate,currency_code,amenities,status,hotel_name,hotel_city,hotel_country,hotel_classification&order=nightly_rate`)
     ]);
     if (settings.length !== 1) throw new Error("Hotel booking content is not configured");
@@ -333,6 +413,80 @@ const getPublicHotelBookingData = async (request, response) => {
     response.json({ tenant, settings: { title: settings[0].booking_title, subtitle: settings[0].booking_subtitle }, offers, rooms });
   } catch (error) {
     response.status(404).json({ error: error instanceof Error ? error.message : "Hotel information could not be loaded" });
+  }
+};
+const getPublicHotelOffers = async (request, response) => {
+  try {
+    const tenant = await resolveRequestHotelTenant(request);
+    const organizationId = encodeURIComponent(tenant.organizationId);
+    const now = (/* @__PURE__ */ new Date()).toISOString();
+    await callTenantRpc("release_expired_hotel_offer_holds_for_tenant", { target_organization_id: tenant.organizationId });
+    const [roomOffers, menuItems, loyaltyPrograms, events] = await Promise.all([
+      readService$2(`hotel_booking_offers?organization_id=eq.${organizationId}&category=eq.accommodation&is_active=eq.true&select=id,title,description,discount_percentage,discount_type,discount_label,discount_amount,currency_code,min_spend,max_discount,promo_code,image,popularity,limited_time,minimum_nights,starts_at,ends_at,display_order,featured,terms,max_uses,usage_count&order=display_order`),
+      readService$2(`menu_items?organization_id=eq.${organizationId}&is_published=eq.true&special_offer=not.is.null&select=id,name,short_description,price,original_price,currency,special_offer,availability,max_availability&order=created_at.asc`),
+      readService$2(`hotel_loyalty_programs?organization_id=eq.${organizationId}&program_enabled=eq.true&select=program_name,points_per_1000_ugx&limit=1`),
+      readService$2(`special_events?organization_id=eq.${organizationId}&status=eq.published&is_private=eq.false&starts_at=gte.${encodeURIComponent(now)}&select=id,title,description,starts_at,ends_at,location,price,currency,category,image_url,featured&order=featured.desc,starts_at.asc`)
+    ]);
+    const dateIsCurrent = (startsAt, endsAt) => (typeof startsAt !== "string" || new Date(startsAt).getTime() <= Date.now()) && (typeof endsAt !== "string" || new Date(endsAt).getTime() > Date.now());
+    const offers = [
+      ...roomOffers.filter((offer) => dateIsCurrent(offer.starts_at, offer.ends_at) && (offer.discount_type === "fixed" ? Boolean(offer.promo_code) && Number(offer.discount_amount) > 0 : Number(offer.discount_percentage) > 0)).map((offer) => ({ ...offer, discount: typeof offer.discount_label === "string" && offer.discount_label.trim() ? offer.discount_label : offer.discount_type === "fixed" ? `${offer.currency_code || ""} ${offer.discount_amount} OFF` : `${Number(offer.discount_percentage)}% OFF`, category: "accommodation", source: "booking" })),
+      ...menuItems.filter((item) => typeof item.special_offer === "string" && item.special_offer.trim()).map((item) => ({ ...item, availability: item.availability === null ? null : Number(item.availability), title: item.name, description: `${item.special_offer}. ${item.short_description || ""}`.trim(), discount: item.original_price && Number(item.original_price) > Number(item.price) ? `${Math.round((1 - Number(item.price) / Number(item.original_price)) * 100)}% OFF` : "MENU SPECIAL", category: "dining", source: "menu" })),
+      ...loyaltyPrograms.map((program) => ({ ...program, id: "hotel-rewards", title: program.program_name, description: `Earn ${program.points_per_1000_ugx} point${Number(program.points_per_1000_ugx) === 1 ? "" : "s"} for every UGX 1,000 spent on eligible purchases.`, discount: "REWARDS", category: "loyalty", source: "loyalty" })),
+      ...events.filter((event) => typeof event.ends_at !== "string" || new Date(event.ends_at).getTime() > Date.now()).map((event) => ({ ...event, title: event.title, discount: event.price && Number(event.price) > 0 ? `FROM ${event.currency || ""} ${event.price}` : "UPCOMING EVENT", category: "seasonal", source: "event" }))
+    ];
+    setPrivateTenantResponse(response);
+    response.json({ tenant, offers });
+  } catch (error) {
+    response.status(404).json({ error: error instanceof Error ? error.message : "Offers could not be loaded" });
+  }
+};
+const checkHotelOfferManagementAccess = async (request, response) => {
+  try {
+    await requireHotelManager(request);
+    setPrivateTenantResponse(response);
+    response.json({ authorized: true });
+  } catch (error) {
+    const status = error.status ?? (error instanceof Error && error.message.includes("Authentication") ? 401 : 503);
+    response.status(status).json({ authorized: false });
+  }
+};
+const getHotelOffersForManagement = async (request, response) => {
+  try {
+    const tenant = await requireHotelManager(request);
+    const organizationId = encodeURIComponent(tenant.organizationId);
+    await callTenantRpc("release_expired_hotel_offer_holds_for_tenant", { target_organization_id: tenant.organizationId });
+    const offers = await readService$2(`hotel_booking_offers?organization_id=eq.${organizationId}&category=eq.accommodation&select=id,title,description,discount_percentage,discount_type,discount_label,discount_amount,currency_code,min_spend,max_discount,promo_code,image,popularity,limited_time,minimum_nights,starts_at,ends_at,display_order,featured,terms,max_uses,usage_count,is_active&order=display_order`);
+    setPrivateTenantResponse(response);
+    response.json({ offers });
+  } catch (error) {
+    const status = error.status ?? (error instanceof Error && error.message.includes("Authentication") ? 401 : 503);
+    response.status(status).json({ error: error instanceof Error ? error.message : "Hotel offers could not be loaded" });
+  }
+};
+const saveHotelOffer = async (request, response) => {
+  try {
+    const tenant = await requireHotelManager(request);
+    const body = request.body;
+    const offerId = body.id;
+    if (offerId !== void 0 && (typeof offerId !== "string" || !isUuid$1(offerId))) {
+      response.status(400).json({ error: "Offer identifier is invalid" });
+      return;
+    }
+    const offer = validateHotelOffer(body);
+    const organizationId = encodeURIComponent(tenant.organizationId);
+    if (typeof offerId === "string") {
+      const updated = await writeService$1(`hotel_booking_offers?id=eq.${encodeURIComponent(offerId)}&organization_id=eq.${organizationId}&select=id`, "PATCH", offer);
+      if (!updated.length) {
+        throw hotelOfferError("Offer was not found for this hotel", 404);
+      }
+    } else {
+      await writeService$1("hotel_booking_offers?select=id", "POST", { ...offer, organization_id: tenant.organizationId });
+    }
+    setPrivateTenantResponse(response);
+    response.json({ ok: true });
+  } catch (error) {
+    const status = error.status ?? (error instanceof Error && error.message.includes("Authentication") ? 401 : 400);
+    response.status(status).json({ error: error instanceof Error ? error.message : "Hotel offer could not be saved" });
   }
 };
 const getPublicMenuItems = async (request, response) => {
@@ -1354,6 +1508,9 @@ const createBooking = async (request, response) => {
       const currency = selectedRoom.currency_code.trim().toUpperCase();
       if (!supportedCurrencies.has(currency) || !ratesSnapshot.rates[currency]) throw new HotelBookingError("This room uses an unsupported booking currency");
     }
+    await callServiceRpc$1("release_expired_hotel_offer_holds_for_tenant", {
+      target_organization_id: tenant.organizationId
+    });
     const rows = await callServiceRpc$1(
       "create_hotel_booking_for_tenant",
       {
@@ -1364,6 +1521,7 @@ const createBooking = async (request, response) => {
           last_name: safeText(body.guest?.lastName, 100),
           email,
           phone: safeText(body.guest?.phone, 40),
+          promo_code: safeText(body.guest?.promoCode, 50).toUpperCase(),
           business_purchase: body.guest?.businessPurchase === true,
           buyer_tax_id: safeText(body.guest?.buyerTaxId, 30)
         },
@@ -1793,10 +1951,11 @@ const getPlatformHotels = async (request, response) => {
   noStore(response);
   try {
     await requirePlatformAdmin(request);
-    const [organizations, settings, domains] = await Promise.all([
+    const [organizations, workerWorkspaces, settings, domains] = await Promise.all([
       readService(
         "books_organizations?select=id,name,country_code,base_currency,owner_id&order=name"
       ),
+      readService("books_worker_workspaces?select=organization_id"),
       readService(
         "hotel_tenant_settings?select=organization_id,display_name,logo_url,primary_color,accent_color,booking_title,booking_subtitle,is_active"
       ),
@@ -1804,8 +1963,9 @@ const getPlatformHotels = async (request, response) => {
         "hotel_tenant_domains?select=domain,organization_id,verification_status,verification_method,verified_at&order=domain"
       )
     ]);
+    const workerOrganizationIds = new Set(workerWorkspaces.map((workspace) => workspace.organization_id));
     response.json({
-      organizations,
+      organizations: organizations.filter((organization) => !workerOrganizationIds.has(organization.id)),
       hotels: settings.map((hotel) => ({
         ...hotel,
         domains: domains.filter((domain) => domain.organization_id === hotel.organization_id)
@@ -1964,6 +2124,10 @@ function createServer() {
   app2.post("/api/hotel-rewards/enrollment", updateHotelRewardsEnrollment);
   app2.post("/api/hotel-complaints", submitHotelComplaint);
   app2.get("/api/hotel-booking-data", getPublicHotelBookingData);
+  app2.get("/api/hotel-offers", getPublicHotelOffers);
+  app2.get("/api/hotel-offers/manage/access", checkHotelOfferManagementAccess);
+  app2.get("/api/hotel-offers/manage", getHotelOffersForManagement);
+  app2.post("/api/hotel-offers/manage", saveHotelOffer);
   app2.get("/api/hotel-menu-items", getPublicMenuItems);
   app2.get("/api/hotel-menu-video/:attachmentId", getPublicMenuVideo);
   app2.post("/api/hotel-menu-availability", requestHotelMenuAvailability);

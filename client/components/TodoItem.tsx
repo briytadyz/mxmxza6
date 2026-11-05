@@ -54,7 +54,7 @@ export const TodoItem: React.FC<TodoItemProps> = ({
     let isActive = true;
     supabase
       .from("worker_task_payments")
-      .select("amount, tax_amount, currency_code, worker_currency_code, fx_rate, fx_rate_source, fx_rate_fetched_at, converted_amount, converted_tax_amount, payment_method, payment_reference, paid_at")
+      .select("task_id, amount, tax_amount, currency_code, worker_currency_code, fx_rate, fx_rate_source, fx_rate_fetched_at, converted_amount, converted_tax_amount, payment_method, payment_reference, paid_at, confirmation_status, worker_acknowledged_at")
       .eq("task_id", todo.task_id)
       .maybeSingle()
       .then(({ data }) => {
@@ -327,19 +327,20 @@ export const TodoItem: React.FC<TodoItemProps> = ({
         )}
 
         {payment && (
-          <div className="p-3 bg-green-100/50 rounded border border-green-300 text-sm space-y-1">
-            <p className="text-green-800 font-semibold">
-              Paid {payment.amount.toLocaleString()} {payment.currency_code} on {new Date(payment.paid_at).toLocaleDateString()}
+          <div className={`p-3 rounded border text-sm space-y-1 ${payment.confirmation_status === "pending_confirmation" ? "bg-amber-50 border-amber-300" : "bg-green-100/50 border-green-300"}`}>
+            <p className={`font-semibold ${payment.confirmation_status === "pending_confirmation" ? "text-amber-900" : "text-green-800"}`}>
+              {payment.confirmation_status === "pending_confirmation" ? "Payment recorded by hotel · confirmation needed" : "Payment received"} · {payment.amount.toLocaleString()} {payment.currency_code} on {new Date(payment.paid_at).toLocaleDateString()}
             </p>
+            {payment.confirmation_status === "pending_confirmation" && <p className="text-amber-900">Confirm receipt in Books to receive the payment receipt.</p>}
             {payment.tax_amount > 0 && (
-              <p className="text-green-800">VAT included: {payment.tax_amount.toLocaleString()} {payment.currency_code}</p>
+              <p className={payment.confirmation_status === "pending_confirmation" ? "text-amber-900" : "text-green-800"}>VAT included: {payment.tax_amount.toLocaleString()} {payment.currency_code}</p>
             )}
             {payment.worker_currency_code && payment.worker_currency_code !== payment.currency_code && payment.converted_amount !== null && payment.fx_rate !== null && (
-              <p className="text-green-800">
-                In your Books: {payment.converted_amount.toLocaleString()} {payment.worker_currency_code} at {payment.fx_rate.toLocaleString(undefined, { maximumFractionDigits: 6 })} per {payment.currency_code}
+              <p className={payment.confirmation_status === "pending_confirmation" ? "text-amber-900" : "text-green-800"}>
+                {payment.confirmation_status === "pending_confirmation" ? "Worker Books amount after confirmation" : "In your Books"}: {payment.converted_amount.toLocaleString()} {payment.worker_currency_code} at {payment.fx_rate.toLocaleString(undefined, { maximumFractionDigits: 6 })} per {payment.currency_code}
               </p>
             )}
-            <p className="text-green-800">Reference: {payment.payment_reference}</p>
+            <p className={payment.confirmation_status === "pending_confirmation" ? "text-amber-900" : "text-green-800"}>Reference: {payment.payment_reference}</p>
           </div>
         )}
       </CardContent>

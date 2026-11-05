@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { Link } from "react-router-dom";
+import { Link, useSearchParams } from "react-router-dom";
 import { format } from "date-fns";
 import { supabase, useSupabaseAuth } from "../lib/supabase";
 import BookingCheckoutModal from "../components/booking/BookingCheckoutModal";
@@ -39,7 +39,7 @@ type HotelRoom = {
   hotel_classification?: number | null;
 };
 
-type BookingOffer = { id: string; title: string; description: string; discount_percentage: number; minimum_nights: number; starts_at: string | null; ends_at: string | null };
+type BookingOffer = { id: string; title: string; description: string; discount_percentage: number; minimum_nights: number; starts_at: string | null; ends_at: string | null; promo_code?: string | null; discount_type?: string; max_discount?: number; currency_code?: string; min_spend?: number; max_uses?: number | null; usage_count?: number };
 type BookingSettings = { title: string; subtitle: string };
 type RoomAvailability = { room_id: string; remaining_units: number };
 type SavedBookingAccess = { bookingId: string; accessToken: string; confirmationNumber: string };
@@ -58,6 +58,8 @@ const getAmenityIcon = (amenity: string) => {
 
 const BookingPage = () => {
   const { toast } = useToast();
+  const [searchParams] = useSearchParams();
+  const queryPromoCode = searchParams.get("promo") || "";
   const { session, initialized: authInitialized } = useSupabaseAuth();
   const { refreshRewardsBalance } = useRewardsPoints();
   const loadedUserIdRef = useRef<string | null | undefined>(undefined);
@@ -74,6 +76,7 @@ const BookingPage = () => {
   const [selectedRoomId, setSelectedRoomId] = useState("");
   const [guests, setGuests] = useState("2");
   const [roomCount, setRoomCount] = useState("1");
+  const [promoCode, setPromoCode] = useState(queryPromoCode);
   const [preferences, setPreferences] = useState<string[]>([]);
   const [specialRequests, setSpecialRequests] = useState("");
   const [checkoutOpen, setCheckoutOpen] = useState(false);
@@ -89,6 +92,8 @@ const BookingPage = () => {
     setCheckIn(date);
     if (date && checkOut && date >= checkOut) setCheckOut(undefined);
   }, [checkOut]);
+
+  useEffect(() => setPromoCode(queryPromoCode), [queryPromoCode]);
 
   useEffect(() => {
     if (!checkIn || !checkOut || checkOut <= checkIn) {
@@ -190,8 +195,13 @@ const BookingPage = () => {
   const selectedRoomUnavailable = selectedRemainingUnits !== null && selectedRemainingUnits < Number(roomCount);
   const alternativeRooms = currentAvailability ? publishedRooms.filter((room) => room.id !== selectedRoomId && (currentAvailability[room.id] ?? 0) >= Number(roomCount)) : [];
   const roomSubtotal = selectedRoom ? Number(selectedRoom.nightly_rate) * totalNights * Number(roomCount) : 0;
-  const applicableDiscount = Math.max(0, ...offers.filter((offer) => totalNights >= offer.minimum_nights).map((offer) => Number(offer.discount_percentage)));
-  const stayDiscount = roomSubtotal * applicableDiscount / 100;
+  const stayDiscount = promoCode.trim() ? 0 : Math.max(0, ...offers.filter((offer) => !offer.promo_code && offer.discount_type !== "fixed" && totalNights >= offer.minimum_nights && Number(offer.min_spend || 0) === 0 && (offer.max_uses == null || Number(offer.usage_count || 0) < offer.max_uses)).map((offer) => {
+    const discount = roomSubtotal * Number(offer.discount_percentage) / 100;
+    const cap = Number(offer.max_discount || 0) > 0 && offer.currency_code?.trim() === selectedRoom?.currency_code.trim()
+      ? Number(offer.max_discount)
+      : Number.POSITIVE_INFINITY;
+    return Math.min(discount, cap, roomSubtotal);
+  }));
 
   const startEditRoom = (room?: HotelRoom) => {
     setEditingRoomId(room?.id || null);
@@ -382,7 +392,7 @@ const BookingPage = () => {
             <Card>
               <CardHeader><CardTitle className="flex items-center gap-2"><Gift className="h-5 w-5 text-sheraton-gold" />Booking summary</CardTitle></CardHeader>
               <CardContent className="space-y-4">
-                {selectedRoom ? <><div className="rounded-lg bg-sheraton-gold/10 p-3"><p className="font-semibold text-sheraton-navy">{selectedRoom.name}</p><p className="mt-1 text-sm text-muted-foreground">{guests} guests · {roomCount} {Number(roomCount) === 1 ? "room" : "rooms"}</p></div><div className="space-y-2 text-sm">{checkIn && <div className="flex justify-between"><span>Check-in</span><span>{format(checkIn, "MMM d, yyyy")}</span></div>}{checkOut && <div className="flex justify-between"><span>Check-out</span><span>{format(checkOut, "MMM d, yyyy")}</span></div>}{totalNights > 0 && <div className="flex justify-between"><span>Length of stay</span><span>{totalNights} {totalNights === 1 ? "night" : "nights"}</span></div>}<Separator /><div className="flex justify-between"><span>Room rate</span><span>{money(roomSubtotal, selectedRoom.currency_code.trim())}</span></div>{stayDiscount > 0 && <div className="flex justify-between text-green-700"><span>Extended-stay savings</span><span>−{money(stayDiscount, selectedRoom.currency_code.trim())}</span></div>}<div className="flex justify-between font-semibold"><span>Room subtotal</span><span>{money(roomSubtotal - stayDiscount, selectedRoom.currency_code.trim())}</span></div><p className="text-xs leading-5 text-muted-foreground">18% Uganda VAT and Local Hotel Tax are calculated securely at checkout using the hotel classification and nightly room rate. Applicable stay offers are loaded from the database; final taxes and amount due are confirmed before payment.</p></div></> : <div className="rounded-lg border border-dashed p-5 text-center text-sm text-muted-foreground">Choose a room and stay dates to see your estimate.</div>}
+                {selectedRoom ? <><div className="rounded-lg bg-sheraton-gold/10 p-3"><p className="font-semibold text-sheraton-navy">{selectedRoom.name}</p><p className="mt-1 text-sm text-muted-foreground">{guests} guests · {roomCount} {Number(roomCount) === 1 ? "room" : "rooms"}</p></div><div className="space-y-2 text-sm">{checkIn && <div className="flex justify-between"><span>Check-in</span><span>{format(checkIn, "MMM d, yyyy")}</span></div>}{checkOut && <div className="flex justify-between"><span>Check-out</span><span>{format(checkOut, "MMM d, yyyy")}</span></div>}{totalNights > 0 && <div className="flex justify-between"><span>Length of stay</span><span>{totalNights} {totalNights === 1 ? "night" : "nights"}</span></div>}<Separator /><div className="flex justify-between"><span>Room rate</span><span>{money(roomSubtotal, selectedRoom.currency_code.trim())}</span></div>{promoCode.trim() && <div className="flex justify-between text-sheraton-navy"><span>Promo code</span><span>{promoCode.trim()} · checked at checkout</span></div>}{stayDiscount > 0 && <div className="flex justify-between text-green-700"><span>Extended-stay savings</span><span>−{money(stayDiscount, selectedRoom.currency_code.trim())}</span></div>}<div className="flex justify-between font-semibold"><span>Room subtotal</span><span>{money(roomSubtotal - stayDiscount, selectedRoom.currency_code.trim())}</span></div><p className="text-xs leading-5 text-muted-foreground">18% Uganda VAT and Local Hotel Tax are calculated securely at checkout using the hotel classification and nightly room rate. Applicable stay offers are loaded from the database; final taxes and amount due are confirmed before payment.</p></div></> : <div className="rounded-lg border border-dashed p-5 text-center text-sm text-muted-foreground">Choose a room and stay dates to see your estimate.</div>}
                 <Button className="w-full sheraton-gradient text-white" size="lg" disabled={!selectedRoom || !checkIn || !checkOut || totalNights <= 0 || Number(guests) > selectedRoom.max_guests * Number(roomCount) || selectedRoomUnavailable} onClick={() => setCheckoutOpen(true)}><CalendarDays className="mr-2 h-4 w-4" />Continue to guest details</Button>
                 {selectedRoom && Number(guests) > selectedRoom.max_guests * Number(roomCount) && <p className="text-xs text-destructive">The selected room inventory cannot accommodate this number of guests.</p>}
                 <div className="flex items-center justify-center gap-2 text-xs text-muted-foreground"><CheckCircle className="h-3.5 w-3.5 text-green-600" />Secure checkout · Payment via Flutterwave</div>
@@ -392,7 +402,7 @@ const BookingPage = () => {
           </aside>
         </div>
 
-        <BookingCheckoutModal isOpen={checkoutOpen} onClose={() => setCheckoutOpen(false)} roomData={selectedRoom} checkIn={checkIn} checkOut={checkOut} guests={guests} roomCount={roomCount} preferences={preferences} specialRequests={specialRequests} totalNights={totalNights} totalPrice={roomSubtotal - stayDiscount} savings={stayDiscount} />
+        <BookingCheckoutModal isOpen={checkoutOpen} onClose={() => setCheckoutOpen(false)} roomData={selectedRoom} checkIn={checkIn} checkOut={checkOut} guests={guests} roomCount={roomCount} preferences={preferences} specialRequests={specialRequests} totalNights={totalNights} totalPrice={roomSubtotal - stayDiscount} savings={stayDiscount} initialPromoCode={promoCode} />
       </div>
     </div>
   );

@@ -138,6 +138,9 @@ export interface Task {
 }
 
 export interface WorkerTaskPayment {
+  task_id: string
+  confirmation_status: 'pending_confirmation' | 'confirmed' | 'legacy_settled'
+  worker_acknowledged_at: string | null
   amount: number
   tax_amount: number
   currency_code: string
